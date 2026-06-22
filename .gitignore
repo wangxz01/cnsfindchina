@@ -1,0 +1,47 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+
+# --- 虚拟环境 ---
+.venv/
+venv/
+env/
+ENV/
+
+# --- IDE ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# --- 操作系统 ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- 项目运行时产物（不入库） ---
+
+# Playwright 持久化浏览器 profile（含 Cloudflare cookie 等敏感数据）
+browser_profile/
+
+# 按 PII 缓存的抓取结果（可重生成）
+cache/
+
+# 输出 Excel（按日期命名 / 用户自定义）
+cell_*.xlsx
+output*.xlsx
+result*.xlsx
+*.xlsx
+
+# Excel 打开时生成的锁文件
+~$*
+
+# 日志
+*.log
