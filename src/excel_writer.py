@@ -27,15 +27,15 @@ DEFAULT_COLUMNS = [
 ]
 
 NATURE_COLUMNS = [
-    ("URL", "url"),
-    ("标题", "title"),
-    ("DOI", "doi"),
-    ("类型", "type"),
-    ("一作", "first_author"),
-    ("一作单位", "first_aff"),
-    ("一作国家", "first_author_country"),
-    ("是否中国", "is_china_label"),
-    ("作者列表", "authors_joined"),
+    ("相关网址", "url"),
+    ("原始数据-标题", "title"),
+    ("原始数据-DOI", "doi"),
+    ("原始数据-类型", "type"),
+    ("原始数据-第一作者", "first_author"),
+    ("原始数据-第一完成单位", "first_aff"),
+    ("提取-国家", "first_author_country"),
+    ("判断-是否中国", "is_china_label"),
+    ("原始数据-所有作者", "authors_joined"),
 ]
 
 
@@ -63,6 +63,7 @@ def write_one_sheet(wb, issue_url: str, results: list,
                     columns=DEFAULT_COLUMNS, col_widths=None) -> None:
     ws = wb.create_sheet(_sheet_name_from_url(issue_url))
     ws.append([issue_url])
+    ws.append([name for name, _ in columns])  # 表头行（每个 sheet 仅顶部一次）
     last_section = None
     for section, url, f in results:
         if section != last_section:
