@@ -60,6 +60,12 @@
   .btn-src:hover:not(:disabled) { border-color: #0071e3; color: #0071e3; }
   .btn-src-active { background: #0071e3; color: #fff; border-color: #0071e3; }
   .btn-src:disabled { opacity: 0.5; cursor: not-allowed; }
+  .src-running-dot {
+    display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+    background: #34c759; margin-left: 4px; vertical-align: middle;
+    animation: pulse 1.4s infinite;
+  }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.35} }
   .btn-sm { padding: 5px 10px; font-size: 12px; }
   .meta-row { display: flex; gap: 24px; font-size: 13px; color: #6e6e73; margin-bottom: 12px; }
   .meta-row b { color: #1d1d1f; font-weight: 600; }
@@ -142,13 +148,13 @@
     切换 source：
     <button v-for="s in sources" :key="s.key"
             @click="switchSource(s.key)"
-            :class="['btn-src', currentSource === s.key ? 'btn-src-active' : '']"
-            :disabled="busy && state.active_source !== s.key">
+            :class="['btn-src', currentSource === s.key ? 'btn-src-active' : '']">
       {{ s.label }}
+      <span v-if="states[s.key].running" class="src-running-dot"></span>
     </button>
-    <span v-if="state.active_source && state.active_source !== currentSource"
-          style="color:#a02020; margin-left:12px;">
-      ⚠ {{ state.active_source.toUpperCase() }} 正在运行，先停止才能切换
+    <span v-if="runningSources.length"
+          style="color:#1a7a3e; margin-left:12px;">
+      ⏵ 后台运行中：{{ runningSources.join(' / ') }}
     </span>
   </div>
 
@@ -201,7 +207,8 @@
         </div>
         <div class="btn-row">
           <button class="btn-primary" @click="start" :disabled="busy">▶ 开始抓取</button>
-          <button class="btn-danger" @click="stop" :disabled="!busy">■ 停止</button>
+          <button class="btn-danger" @click="stop" :disabled="!busy">■ 停止当前</button>
+          <button class="btn-danger" @click="stopAll" v-if="runningSources.length > 1">■ 停止全部</button>
           <button class="btn-ghost" @click="resetCache" :disabled="busy">🗑 清空缓存</button>
           <button class="btn-ghost" @click="download" :disabled="!state.out_path">⬇ 下载 Excel</button>
         </div>
@@ -260,7 +267,8 @@ import { createApp, reactive, computed, ref, onMounted, nextTick, watch } from '
 
 createApp({
   setup() {
-    const state = reactive({
+    // 三个 source 各自独立的状态桶；切换不丢数据
+    const _emptyState = () => ({
       status: 'idle',
       current_issue: '',
       issue_idx: 0,
@@ -272,10 +280,15 @@ createApp({
       cf_info: {},
       out_path: '',
       error_msg: '',
+      running: false,
     });
-    const urlsText = ref('');
-    const logLines = ref([]);
-    const articles = ref([]);
+    const states = reactive({
+      cell: _emptyState(), nature: _emptyState(), science: _emptyState(),
+    });
+    const urlsBySource = reactive({cell: '', nature: '', science: ''});
+    const logsBySource = reactive({cell: [], nature: [], science: []});
+    const articlesBySource = reactive({cell: [], nature: [], science: []});
+
     const logEl = ref(null);
     const currentSource = ref('cell');
     const sources = ref([
@@ -284,17 +297,32 @@ createApp({
       {key: 'science', label: 'Science'},
     ]);
 
-    const busy = computed(() => state.status === 'running' || state.status === 'cf_blocked');
+    // 当前 source 视图（computed 让模板透明切换）
+    const state = computed(() => states[currentSource.value]);
+    const urlsText = computed({
+      get: () => urlsBySource[currentSource.value],
+      set: (v) => { urlsBySource[currentSource.value] = v; },
+    });
+    const logLines = computed(() => logsBySource[currentSource.value]);
+    const articles = computed(() => articlesBySource[currentSource.value]);
+
+    const busy = computed(() => state.value.status === 'running' || state.value.status === 'cf_blocked');
     const statusLabel = computed(() => ({
       idle: '空闲', running: '抓取中', cf_blocked: 'CF 等待',
       done: '完成', error: '错误', cancelled: '已取消',
-    }[state.status] || state.status));
+    }[state.value.status] || state.value.status));
     const progressPercent = computed(() => {
-      if (state.issue_total === 0) return 0;
-      const t = (state.issue_idx - 1) + (state.article_total ? state.article_idx / state.article_total : 0);
-      return Math.min(100, Math.round(t / state.issue_total * 100));
+      const s = state.value;
+      if (s.issue_total === 0) return 0;
+      const t = (s.issue_idx - 1) + (s.article_total ? s.article_idx / s.article_total : 0);
+      return Math.min(100, Math.round(t / s.issue_total * 100));
     });
     const chinaCount = computed(() => articles.value.filter(a => a.is_china).length);
+
+    // 其它 source 是否在跑（用于在切换按钮上显示指示点）
+    const runningSources = computed(() =>
+      Object.entries(states).filter(([k, v]) => v.running).map(([k]) => k)
+    );
 
     function lineClass(line) {
       if (/error/i.test(line)) return 'line-error';
@@ -304,63 +332,75 @@ createApp({
     }
 
     // ---- API ----
-    async function loadUrls() {
-      const r = await fetch(`/api/urls.txt?source=${currentSource.value}`);
+    async function loadUrls(src) {
+      src = src || currentSource.value;
+      const r = await fetch(`/api/urls.txt?source=${src}`);
       const j = await r.json();
-      urlsText.value = j.content || '';
+      urlsBySource[src] = j.content || '';
     }
     async function saveUrls() {
-      await fetch(`/api/urls.txt?source=${currentSource.value}`, {
+      const src = currentSource.value;
+      await fetch(`/api/urls.txt?source=${src}`, {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({content: urlsText.value}),
+        body: JSON.stringify({content: urlsBySource[src]}),
       });
-      log(`已保存 ${currentSource.value} 的 urls.txt`);
+      pushLog(src, `[ui] 已保存 ${src} 的 urls.txt`);
     }
     async function start() {
-      articles.value = [];
-      logLines.value = [];
+      const src = currentSource.value;
+      articlesBySource[src] = [];
+      logsBySource[src] = [];
       await saveUrls();
-      const r = await fetch(`/api/start?source=${currentSource.value}`, {
+      const r = await fetch(`/api/start?source=${src}`, {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({}),
       });
       if (!r.ok) {
         const e = await r.json().catch(() => ({detail: r.statusText}));
-        log('[error] ' + (e.detail || r.status));
+        pushLog(src, '[error] ' + (e.detail || r.status));
       }
     }
     async function stop() {
+      const src = currentSource.value;
+      await fetch(`/api/stop?source=${src}`, {method: 'POST'});
+      pushLog(src, '[ui] 已请求停止（将在下一个检查点生效）');
+    }
+    async function stopAll() {
       await fetch('/api/stop', {method: 'POST'});
-      log('[ui] 已请求停止（将在下一个检查点生效）');
+      pushLog(currentSource.value, '[ui] 已请求停止所有 source');
     }
     async function resumeCf() {
-      await fetch('/api/cf_resumed', {method: 'POST'});
-      log('[ui] 已通知后端继续');
+      const src = currentSource.value;
+      await fetch(`/api/cf_resumed?source=${src}`, {method: 'POST'});
+      pushLog(src, '[ui] 已通知后端继续');
     }
     async function resetCache() {
-      if (!confirm(`确认清空 ${currentSource.value} 的缓存？下次会全部重抓。`)) return;
-      await fetch(`/api/reset_cache?source=${currentSource.value}`, {method: 'POST'});
-      log(`[ui] ${currentSource.value} 缓存已清空`);
+      const src = currentSource.value;
+      if (!confirm(`确认清空 ${src} 的缓存？下次会全部重抓。`)) return;
+      await fetch(`/api/reset_cache?source=${src}`, {method: 'POST'});
+      pushLog(src, `[ui] ${src} 缓存已清空`);
     }
     function download() {
-      window.open('/api/download', '_blank');
+      window.open(`/api/download?source=${currentSource.value}`, '_blank');
     }
     async function switchSource(key) {
-      if (state.active_source && state.active_source !== key) {
-        alert(`正在运行 ${state.active_source}，请先停止`);
-        return;
-      }
+      // 完全无阻塞切换：三个 source 独立，无需停止当前
       currentSource.value = key;
-      articles.value = [];
-      logLines.value = [];
-      await loadUrls();
-      log(`[ui] 切换到 ${key}`);
+      if (!urlsBySource[key]) await loadUrls(key);
+      pushLog(key, `[ui] 切换查看 ${key}`);
+      // 同步当前 source 的最新状态
+      try {
+        const r = await fetch(`/api/status?source=${key}`);
+        const j = await r.json();
+        Object.assign(states[key], j);
+      } catch {}
     }
 
-    function log(msg) {
-      logLines.value.push(msg);
+    function pushLog(src, msg) {
+      // 只为当前 source 触发响应式追加；其它 source 静默累积
+      logsBySource[src].push(msg);
     }
 
     // ---- SSE ----
@@ -369,43 +409,45 @@ createApp({
       es.onmessage = (ev) => {
         let d;
         try { d = JSON.parse(ev.data); } catch { return; }
-        // log / article_done 都带 source 字段；只在当前 source 时显示
-        const evSource = d.source;
+        const src = d.source;
+        if (!src) return;
+
         if (d.type === 'log') {
-          if (evSource && evSource !== currentSource.value) return;
-          logLines.value.push(d.data);
-          // 自动滚到底
-          nextTick(() => {
-            const el = logEl.value;
-            if (el) el.scrollTop = el.scrollHeight;
-          });
+          logsBySource[src].push(d.data);
+          // 只为当前 source 自动滚到底
+          if (src === currentSource.value) {
+            nextTick(() => {
+              const el = logEl.value;
+              if (el) el.scrollTop = el.scrollHeight;
+            });
+          }
         } else if (d.type === 'state') {
-          Object.assign(state, d.data);
+          // 所有 source 的 state 都更新（这样切换时无需重新请求）
+          Object.assign(states[src], d.data);
         } else if (d.type === 'article_done') {
-          if (evSource && evSource !== currentSource.value) return;
-          articles.value.push(d.data);
+          articlesBySource[src].push(d.data);
         }
       };
-      es.onerror = () => {
-        // 自动重连由浏览器处理
-      };
+      es.onerror = () => { /* 浏览器自动重连 */ };
     }
 
     onMounted(async () => {
-      await loadUrls();
+      // 三个 source 的 urls 都加载（切换时无需等待）
+      await Promise.all(['cell', 'nature', 'science'].map(k => loadUrls(k)));
       connectSSE();
-      // 拉一次当前状态
+      // 拉一次所有 source 的状态
       try {
         const r = await fetch('/api/status');
-        Object.assign(state, await r.json());
+        const j = await r.json();
+        for (const k of Object.keys(j)) Object.assign(states[k], j[k]);
       } catch {}
     });
 
     return {
       state, urlsText, logLines, articles, logEl,
-      sources, currentSource,
+      sources, currentSource, runningSources,
       busy, statusLabel, progressPercent, lineClass, chinaCount,
-      loadUrls, saveUrls, start, stop, resumeCf, resetCache, download,
+      loadUrls, saveUrls, start, stop, stopAll, resumeCf, resetCache, download,
       switchSource,
     };
   }
