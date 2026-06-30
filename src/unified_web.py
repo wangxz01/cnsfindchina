@@ -44,6 +44,10 @@ class SourceConfig:
         self.col_widths = col_widths
 
 
+# 9 列 NATURE_COLUMNS 的统一列宽（URL/标题/DOI/类型/一作/单位/国家/中国/作者列表）
+DEFAULT_COL_WIDTHS = [55, 55, 25, 14, 18, 60, 14, 10, 50]
+
+
 SOURCES: dict[str, SourceConfig] = {
     "cell": SourceConfig(
         key="cell", label="Cell",
@@ -52,7 +56,7 @@ SOURCES: dict[str, SourceConfig] = {
         default_out=cell_mod.default_out_path,
         run_scraper=cell_mod.run_scraper,
         columns=cell_mod.NATURE_COLUMNS,
-        col_widths=[55, 55, 25, 14, 18, 60, 14, 10, 50],
+        col_widths=DEFAULT_COL_WIDTHS,
     ),
     "nature": SourceConfig(
         key="nature", label="Nature",
@@ -61,7 +65,7 @@ SOURCES: dict[str, SourceConfig] = {
         default_out=nature_mod.default_out_path,
         run_scraper=nature_mod.run_scraper,
         columns=nature_mod.NATURE_COLUMNS,
-        col_widths=[55, 55, 25, 14, 18, 60, 14, 10, 50],
+        col_widths=DEFAULT_COL_WIDTHS,
     ),
     "science": SourceConfig(
         key="science", label="Science",
@@ -70,7 +74,7 @@ SOURCES: dict[str, SourceConfig] = {
         default_out=science_mod.default_out_path,
         run_scraper=science_mod.run_scraper,
         columns=science_mod.NATURE_COLUMNS,
-        col_widths=[55, 55, 25, 14, 18, 60, 14, 10, 50],
+        col_widths=DEFAULT_COL_WIDTHS,
     ),
 }
 
@@ -443,6 +447,40 @@ def reset_cache(source: str = Query(...)):
             try: f.unlink()
             except Exception: pass
     return {"ok": True}
+
+
+@app.post("/api/export")
+def export_now(source: str = Query(...)):
+    """立即从 cache 重建 Excel 并返回路径（中途手动导出）。
+
+    遍历 cache 目录所有 JSON，按 issue URL 分组（每个 cache 文件含 url 字段），
+    写到该 source 默认输出路径。
+    """
+    cfg = _resolve_source(source)
+    session = SESSIONS[source]
+    if not cfg.cache_dir.exists() or not any(cfg.cache_dir.glob("*.json")):
+        raise HTTPException(status_code=404, detail=f"{source} 缓存为空，无可导出数据")
+
+    # 读所有 cache 文件，按 url 里的 issue 标识分组（这里简化：直接当一组写入单 sheet）
+    # 注意：cache 文件不含 issue_url 信息，只能按 source 全部合并到一个 sheet
+    # 取一个合成 issue key（实际 sheet 名按 source+日期）
+    from excel_writer import write_excel
+    cached_items = []
+    for f in sorted(cfg.cache_dir.glob("*.json")):
+        try:
+            d = json.loads(f.read_text(encoding="utf-8"))
+            cached_items.append(("", d.get("url", ""), d))
+        except Exception:
+            continue
+    out_path = session.out_path or cfg.default_out()
+    out_path = str(Path(out_path).resolve())
+    # 用一个虚拟 issue URL 作为 sheet 标题来源
+    virtual_issue = f"export ({source} cache)"
+    actual = write_excel(out_path, [(virtual_issue, cached_items)],
+                         columns=cfg.columns, col_widths=cfg.col_widths)
+    session.out_path = actual
+    bus.broadcast({"type": "state", "source": source, "data": session.snapshot()})
+    return {"ok": True, "out_path": actual, "count": len(cached_items)}
 
 
 def main():

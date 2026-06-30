@@ -25,6 +25,14 @@ if TYPE_CHECKING:
     from scraper import ScraperCallbacks
 
 
+# ---------- 项目目录布局 ----------
+# 项目根 = 本文件所在目录的上一级（src/ 的父目录）
+PROJECT_ROOT = Path(__file__).parent.parent
+# 所有运行时 I/O（urls / 缓存 / 浏览器 profile / 输出 xlsx）都放 data/
+DATA_DIR = PROJECT_ROOT / "data"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+
 # ---------- 缓存（按文章 ID；PII 或 DOI） ----------
 
 
@@ -75,8 +83,8 @@ def load_urls(urls_file: Path) -> list[str]:
 
 
 def default_out_path(prefix: str) -> str:
-    """按日期命名：<prefix>_YYYY-MM-DD.xlsx"""
-    return f"{prefix}_{date.today().isoformat()}.xlsx"
+    """按日期命名，放在 data/ 目录下：data/<prefix>_YYYY-MM-DD.xlsx"""
+    return str(DATA_DIR / f"{prefix}_{date.today().isoformat()}.xlsx")
 
 
 # ---------- goto 重试（Science 启用，其它可选用） ----------

@@ -35,6 +35,7 @@ from scraper_common import (
     load_urls as _common_load_urls,
     default_out_path as _common_default_out,
     count_real_articles,
+    DATA_DIR,
 )
 
 
@@ -51,12 +52,18 @@ def _country_helpers():
 BASE = "https://www.sciencedirect.com"
 ISSUE_URL_EXAMPLE = "https://www.sciencedirect.com/journal/cell/vol/189/issue/10"
 
-# 只爬这三个 section
-WANTED_SECTIONS = {"Articles", "Short Articles", "Resources"}
+# 只爬这三个 section（substring 匹配，兼容 Articles/Article 等变体）
+WANTED_SECTIONS = {"article", "short article", "resource"}
 
-PROFILE_DIR = Path(__file__).parent / "browser_profile"
-URLS_FILE = Path(__file__).parent / "urls.txt"
-CACHE_DIR = Path(__file__).parent / "cache"
+PROFILE_DIR = DATA_DIR / "browser_profile"
+URLS_FILE = DATA_DIR / "urls.txt"
+CACHE_DIR = DATA_DIR / "cache"
+
+
+def _section_wanted(section: str) -> bool:
+    """大小写不敏感的 substring 匹配。"""
+    s = (section or "").lower()
+    return any(w in s for w in WANTED_SECTIONS)
 
 
 # ---------- Callbacks ----------
@@ -528,7 +535,7 @@ def process_issue(page, issue_url: str, use_cache: bool = True,
 
     all_articles = extract_article_list(page)
     cb.log(f"[*] 共发现 {len(all_articles)} 篇文章（全部 section）")
-    targets = [t for t in all_articles if t[0] in WANTED_SECTIONS]
+    targets = [t for t in all_articles if _section_wanted(t[0])]
     cb.log(f"[*] 过滤到 Articles/Short Articles/Resources：{len(targets)} 篇")
     for sec, url, ttl in targets:
         cb.log(f"      - [{sec}] {ttl[:60]}")
@@ -558,6 +565,8 @@ def process_issue(page, issue_url: str, use_cache: bool = True,
                 results.append((section, url, cached))
                 cb.on_state({"phase": "article_done", "url": url,
                              "fields": cached, "cached": True})
+                # 小延迟让前端进度条来得及渲染
+                time.sleep(0.05)
                 continue
 
         cb.log(f"\n[{i}/{total}] 打开: {url}")

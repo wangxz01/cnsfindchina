@@ -44,6 +44,7 @@ from scraper_common import (
     load_urls as _common_load_urls,
     default_out_path as _common_default_out,
     count_real_articles,
+    DATA_DIR,
 )
 
 
@@ -52,12 +53,21 @@ from scraper_common import (
 BASE = "https://www.nature.com"
 
 # 只处理这两个 section（都是 s41586- 研究论文）
-WANTED_SECTIONS = {"Articles", "Perspective"}
+# 用小写 substring 匹配，避免单复数/大小写差异导致 0 篇
+WANTED_SECTIONS = {"article", "perspective"}
 
 # Cell 与 Nature 用不同 profile / cache，避免 cookie 互染
-PROFILE_DIR = Path(__file__).parent / "browser_profile_nature"
-URLS_FILE = Path(__file__).parent / "urls_nature.txt"
-CACHE_DIR = Path(__file__).parent / "cache_nature"
+PROFILE_DIR = DATA_DIR / "browser_profile_nature"
+URLS_FILE = DATA_DIR / "urls_nature.txt"
+CACHE_DIR = DATA_DIR / "cache_nature"
+
+
+def _section_wanted(section: str) -> bool:
+    """大小写不敏感的 substring 匹配，兼容单复数与多余修饰词。"""
+    s = (section or "").lower()
+    # 注意 "article" 会匹配到 "research article" / "article correction" 等；
+    # 我们已在上游把 Author/Publisher Correction 过滤掉，所以这里安全
+    return any(w in s for w in WANTED_SECTIONS)
 
 
 # ---------- 国别识别 ----------
@@ -390,7 +400,7 @@ def process_issue(page, issue_url: str, use_cache: bool = True,
 
     all_articles = extract_article_list(page)
     cb.log(f"[*] 共发现 {len(all_articles)} 篇 s41586 文章（Articles + Perspective）")
-    targets = [t for t in all_articles if t[0] in WANTED_SECTIONS]
+    targets = [t for t in all_articles if _section_wanted(t[0])]
     cb.log(f"[*] 过滤到 Articles/Perspective：{len(targets)} 篇")
     for sec, url, ttl in targets:
         cb.log(f"      - [{sec}] {ttl[:60]}")
@@ -420,6 +430,8 @@ def process_issue(page, issue_url: str, use_cache: bool = True,
                 results.append((section, url, cached))
                 cb.on_state({"phase": "article_done", "url": url,
                              "fields": cached, "cached": True})
+                # 小延迟让前端进度条来得及渲染
+                time.sleep(0.05)
                 continue
 
         cb.log(f"\n[{i}/{total}] 打开: {url}")

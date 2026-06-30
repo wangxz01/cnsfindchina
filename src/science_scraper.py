@@ -47,15 +47,23 @@ from scraper_common import (
     load_urls as _common_load_urls,
     default_out_path as _common_default_out,
     count_real_articles,
+    DATA_DIR,
 )
 
 BASE = "https://www.science.org"
 # 只处理 Research Articles（专业论文）；Perspectives 是评论性短文，不算专业论文
-WANTED_SECTIONS = {"Research Articles"}
+# 用小写 substring 匹配，避免期刊改名（如 "Research Article" 单数）导致 0 篇
+WANTED_SECTIONS = {"research article"}
 
-PROFILE_DIR = Path(__file__).parent / "browser_profile_science"
-URLS_FILE = Path(__file__).parent / "urls_science.txt"
-CACHE_DIR = Path(__file__).parent / "cache_science"
+PROFILE_DIR = DATA_DIR / "browser_profile_science"
+URLS_FILE = DATA_DIR / "urls_science.txt"
+CACHE_DIR = DATA_DIR / "cache_science"
+
+
+def _section_wanted(section: str) -> bool:
+    """大小写/单复数不敏感的 substring 匹配。"""
+    s = (section or "").lower()
+    return any(w in s for w in WANTED_SECTIONS)
 
 
 # ---------- issue 列表抽取 ----------
@@ -311,7 +319,7 @@ def process_issue(page, issue_url: str, use_cache: bool = True,
         cb.log("[error] 0 篇文章，请检查上方 DOM 状态（可能是 cookie 墙未过 / 反爬 / 结构变化）")
         return []
 
-    targets = [t for t in all_articles if t[0] in WANTED_SECTIONS]
+    targets = [t for t in all_articles if _section_wanted(t[0])]
     cb.log(f"[*] 过滤到 {WANTED_SECTIONS}：{len(targets)} 篇")
     for sec, url, ttl in targets:
         cb.log(f"      - [{sec}] {ttl[:60]}")
@@ -348,6 +356,8 @@ def process_issue(page, issue_url: str, use_cache: bool = True,
                 results.append((section, url, cached))
                 cb.on_state({"phase": "article_done", "url": url,
                              "fields": cached, "cached": True})
+                # 小延迟让前端进度条/列表来得及渲染（全命中时 otherwise 瞬时跳到 100%）
+                time.sleep(0.05)
                 continue
 
         cb.log(f"\n[{i}/{total}] 打开: {url}")

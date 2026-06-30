@@ -60,6 +60,20 @@
   .btn-src:hover:not(:disabled) { border-color: #0071e3; color: #0071e3; }
   .btn-src-active { background: #0071e3; color: #fff; border-color: #0071e3; }
   .btn-src:disabled { opacity: 0.5; cursor: not-allowed; }
+  .btn-src-cf-alert {
+    border-color: #f5a623 !important;
+    box-shadow: 0 0 0 2px rgba(245, 166, 35, 0.35);
+    animation: cf-pulse 1.2s infinite;
+  }
+  @keyframes cf-pulse {
+    0%,100% { box-shadow: 0 0 0 2px rgba(245, 166, 35, 0.35); }
+    50%     { box-shadow: 0 0 0 4px rgba(245, 166, 35, 0.6); }
+  }
+  .src-cf-badge {
+    display: inline-block; padding: 0 5px; margin-left: 4px;
+    background: #f5a623; color: #fff; border-radius: 3px;
+    font-size: 10px; font-weight: 700; vertical-align: middle;
+  }
   .src-running-dot {
     display: inline-block; width: 7px; height: 7px; border-radius: 50%;
     background: #34c759; margin-left: 4px; vertical-align: middle;
@@ -148,13 +162,20 @@
     切换 source：
     <button v-for="s in sources" :key="s.key"
             @click="switchSource(s.key)"
-            :class="['btn-src', currentSource === s.key ? 'btn-src-active' : '']">
+            :class="['btn-src',
+                     currentSource === s.key ? 'btn-src-active' : '',
+                     cfBlockedSources.includes(s.key) ? 'btn-src-cf-alert' : '']">
       {{ s.label }}
       <span v-if="states[s.key].running" class="src-running-dot"></span>
+      <span v-if="cfBlockedSources.includes(s.key)" class="src-cf-badge">CF</span>
     </button>
     <span v-if="runningSources.length"
           style="color:#1a7a3e; margin-left:12px;">
       ⏵ 后台运行中：{{ runningSources.join(' / ') }}
+    </span>
+    <span v-if="cfBlockedSources.length"
+          style="color:#8a6300; margin-left:12px; font-weight:600;">
+      ⚠ 待过 CF：{{ cfBlockedSources.join(' / ') }}
     </span>
   </div>
 
@@ -210,6 +231,7 @@
           <button class="btn-danger" @click="stop" :disabled="!busy">■ 停止当前</button>
           <button class="btn-danger" @click="stopAll" v-if="runningSources.length > 1">■ 停止全部</button>
           <button class="btn-ghost" @click="resetCache" :disabled="busy">🗑 清空缓存</button>
+          <button class="btn-ghost" @click="exportNow" :disabled="busy">⤓ 立即导出</button>
           <button class="btn-ghost" @click="download" :disabled="!state.out_path">⬇ 下载 Excel</button>
         </div>
         <div class="footnote" v-if="state.error_msg" style="color: #a02020;">
@@ -323,6 +345,10 @@ createApp({
     const runningSources = computed(() =>
       Object.entries(states).filter(([k, v]) => v.running).map(([k]) => k)
     );
+    // 哪些 source 正卡在 CF 等待（用于按钮加黄框提醒去处理）
+    const cfBlockedSources = computed(() =>
+      Object.entries(states).filter(([k, v]) => v.status === 'cf_blocked').map(([k]) => k)
+    );
 
     function lineClass(line) {
       if (/error/i.test(line)) return 'line-error';
@@ -384,6 +410,16 @@ createApp({
     }
     function download() {
       window.open(`/api/download?source=${currentSource.value}`, '_blank');
+    }
+    async function exportNow() {
+      const src = currentSource.value;
+      pushLog(src, '[ui] 正在从缓存重建 Excel...');
+      try {
+        const r = await fetch(`/api/export?source=${src}`, {method: 'POST'});
+        const j = await r.json();
+        if (r.ok) pushLog(src, `[ui] 已导出 ${j.count} 篇到 ${j.out_path}`);
+        else pushLog(src, `[error] 导出失败: ${j.detail || r.status}`);
+      } catch (e) { pushLog(src, `[error] ${e}`); }
     }
     async function switchSource(key) {
       // 完全无阻塞切换：三个 source 独立，无需停止当前
@@ -453,9 +489,9 @@ createApp({
 
     return {
       state, states, urlsText, logLines, articles, logEl,
-      sources, currentSource, runningSources,
+      sources, currentSource, runningSources, cfBlockedSources,
       busy, statusLabel, progressPercent, lineClass, chinaCount,
-      loadUrls, saveUrls, start, stop, stopAll, resumeCf, resetCache, download,
+      loadUrls, saveUrls, start, stop, stopAll, resumeCf, resetCache, download, exportNow,
       switchSource,
     };
   }

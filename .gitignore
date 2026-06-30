@@ -26,26 +26,20 @@ ENV/
 Thumbs.db
 desktop.ini
 
-# --- 项目运行时产物（不入库） ---
+# --- 项目运行时产物（不入库，全部在 data/ 下；urls*.txt 除外，要入库） ---
 
-# Playwright 持久化浏览器 profile（含 Cloudflare cookie 等敏感数据）
-# 覆盖 cell/nature/science 三套独立 profile
-browser_profile/
-browser_profile_nature/
-browser_profile_science/
+# Playwright 持久化浏览器 profile（含 CF cookie 等敏感数据）
+data/browser_profile/
+data/browser_profile_nature/
+data/browser_profile_science/
 
 # 按文章 ID 缓存的抓取结果（可重生成）
-cache/
-cache_nature/
-cache_science/
+data/cache/
+data/cache_nature/
+data/cache_science/
 
 # 输出 Excel（按日期命名 / 用户自定义）
-cell_*.xlsx
-nature_*.xlsx
-science_*.xlsx
-output*.xlsx
-result*.xlsx
-*.xlsx
+data/*.xlsx
 
 # Excel 打开时生成的锁文件
 ~$*
