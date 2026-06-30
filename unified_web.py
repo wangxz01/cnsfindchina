@@ -234,7 +234,15 @@ class WebCallbacks(ScraperCallbacks):
         elif phase == "excel_written":
             self.session.set_status("running", out_path=state.get("out_path", ""))
         elif phase == "all_done":
-            self.session.set_status("done", out_path=state.get("out_path", ""))
+            self.session.set_status("done", out_path=state.get("out_path", ""),
+                                    error_msg="")
+        elif phase == "all_skipped":
+            # 0 篇成功：标 error 让用户知道有问题，但 out_path 仍设上（可能含 BLOCKED 占位行）
+            self.session.set_status(
+                "error",
+                out_path=state.get("out_path", ""),
+                error_msg=state.get("reason", "0 篇文章抓取成功（CF/cookie 墙或结构变化）"),
+            )
 
 
 def _worker(source_key: str, urls, out_path, use_cache):

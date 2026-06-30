@@ -76,8 +76,11 @@ def write_one_sheet(wb, issue_url: str, results: list,
 
 
 def write_excel(out_path: str, all_issues: list,
-                columns=DEFAULT_COLUMNS, col_widths=None) -> None:
-    """all_issues: [(issue_url, results), ...]。每个 issue 一个 sheet。"""
+                columns=DEFAULT_COLUMNS, col_widths=None) -> str:
+    """all_issues: [(issue_url, results), ...]。每个 issue 一个 sheet。
+
+    返回实际写入的路径（若 out_path 被占用，会改写到带时间戳的备用文件）。
+    """
     wb = openpyxl.Workbook()
     wb.remove(wb.active)  # 删除默认 sheet
     for issue_url, results in all_issues:
@@ -85,11 +88,13 @@ def write_excel(out_path: str, all_issues: list,
 
     try:
         wb.save(out_path)
+        return out_path
     except PermissionError:
         # 文件被占用（如 Excel 打开中）→ 写到带时间戳的备用文件
         ts = time.strftime("%Y%m%d_%H%M%S")
         alt = str(Path(out_path).with_suffix(f".{ts}.xlsx"))
         print(f"[warn] {out_path} 被占用，改写到: {alt}")
         wb.save(alt)
+        return alt
 
 

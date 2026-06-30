@@ -124,8 +124,11 @@ def random_mouse_jitter(page, moves: int | None = None) -> None:
 # ---------- Cloudflare ----------
 
 
-# 直接扫描 HTML 内容判断 CF，不依赖 title() / innerText（CF 挑战页常把它们清空）
+# 直接扫描 HTML 内容判断 CF / 拦截页（不含 cookie 同意墙的通用文字——
+# 那些文字在用户已同意后仍可能留在 DOM 仅 CSS 隐藏，raw scan 会误判。
+# Cookie 墙的检测见 is_cloudflare() 中的可见性检查。）
 CF_HTML_MARKERS = (
+    # Cloudflare
     "just a moment",
     "are you a robot",
     "checking if the site connection is secure",
@@ -141,6 +144,29 @@ CF_HTML_MARKERS = (
     "challenge-platform",
     "_cf_chl_opt",
     "cf-mitigated: challenge",
+    # Nature interstitial（"Thank you for visiting nature.com ..." 整页拦截）
+    "thank you for visiting nature.com",
+    "you are using a browser version with limited support",
+    # 通用反爬
+    "access denied",
+    "request blocked",
+    "to continue, please complete the security check",
+    "your activity is a little suspicious",
+)
+
+
+# Cookie 同意墙常见选择器（用 element visibility 判断，避免误判已隐藏的横幅）
+COOKIE_BANNER_SELECTORS = (
+    "#cookie-policy-banner",       # Springer/Nature
+    "#cookie-banner",              # Science.org / 通用
+    "#cookie-notification",
+    ".cc-banner",
+    ".cookie-banner",
+    ".cookie-disclaimer",
+    ".cookie-message",
+    '[id*="cookie-consent"]',
+    '[class*="cookie-consent"]',
+    '[class*="CookieConsent"]',
 )
 
 
@@ -163,7 +189,11 @@ def detect_cf_in_html(html: str) -> tuple[bool, str]:
 
 
 def is_cloudflare(page) -> bool:
-    """扫描 page.content() 判断 CF；网络异常时返回 True（保守处理）。"""
+    """扫描 page.content() 判断 CF/拦截；另检查 cookie 同意墙元素是否可见。
+
+    返回 True 表示"页面被某种墙挡住，需要用户介入"。
+    网络异常时返回 True（保守处理）。
+    """
     try:
         html = page.content()
     except Exception:
@@ -172,7 +202,34 @@ def is_cloudflare(page) -> bool:
     if is_cf:
         return True
     # URL 兜底
-    return "cdn-cgi/challenge" in (page.url or "").lower()
+    if "cdn-cgi/challenge" in (page.url or "").lower():
+        return True
+    # Cookie 同意墙：用元素可见性判断（raw HTML 里的文字即便同意后仍在）
+    try:
+        blocked = page.evaluate(
+            """
+            (selectors) => {
+                for (const sel of selectors) {
+                    const els = document.querySelectorAll(sel);
+                    for (const el of els) {
+                        if (!el.offsetParent && !el.getClientRects().length) continue;
+                        // 排除明确 aria-hidden 或 display:none 的
+                        const style = window.getComputedStyle(el);
+                        if (style.display === 'none' || style.visibility === 'hidden') continue;
+                        if (parseFloat(style.opacity) < 0.1) continue;
+                        return true;
+                    }
+                }
+                return false;
+            }
+            """,
+            list(COOKIE_BANNER_SELECTORS),
+        )
+        if blocked:
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def wait_until_cf_clear(page, target_url: str | None = None,
@@ -634,8 +691,11 @@ def run_scraper(urls: list[str], out_path: str | Path,
                          "issue_total": len(urls), "issue_url": issue_url})
             results = process_issue(page, issue_url, use_cache=use_cache, cb=cb)
             all_issues.append((issue_url, results))
-            write_excel(out_path, all_issues, columns=NATURE_COLUMNS,
+            actual_out = write_excel(out_path, all_issues, columns=NATURE_COLUMNS,
                         col_widths=[55, 55, 25, 14, 18, 60, 14, 10, 50])
+            if actual_out != out_path:
+                cb.log(f"[warn] 原文件被占用，实际写入: {actual_out}")
+                out_path = actual_out
             cb.log(f"\n[issue {idx}] 完成，共 {len(results)} 篇；已写入 {out_path}")
             cb.on_state({"phase": "excel_written", "out_path": out_path,
                          "issue_url": issue_url})
@@ -649,8 +709,19 @@ def run_scraper(urls: list[str], out_path: str | Path,
 
         ctx.close()
 
-    cb.log(f"\n[done] 全部完成，结果写入 {out_path}")
-    cb.on_state({"phase": "all_done", "out_path": out_path})
+    # 统计实际拿到的（非 BLOCKED/FAILED）文章数；为 0 视为异常
+    real_count = sum(
+        1 for _, results in all_issues
+        for _, _, f in results
+        if f.get("title") and f["title"] not in ("[CF BLOCKED]", "[GOTO FAILED]")
+    )
+    if real_count == 0:
+        cb.log(f"\n[warn] 全部完成但 0 篇成功（可能 CF/cookie 墙未过或结构变化）")
+        cb.on_state({"phase": "all_skipped", "out_path": out_path,
+                     "reason": "0 篇文章抓取成功"})
+    else:
+        cb.log(f"\n[done] 全部完成（{real_count} 篇），结果写入 {out_path}")
+        cb.on_state({"phase": "all_done", "out_path": out_path})
     return all_issues
 
 

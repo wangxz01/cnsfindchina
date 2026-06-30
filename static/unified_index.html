@@ -309,7 +309,7 @@ createApp({
     const busy = computed(() => state.value.status === 'running' || state.value.status === 'cf_blocked');
     const statusLabel = computed(() => ({
       idle: '空闲', running: '抓取中', cf_blocked: 'CF 等待',
-      done: '完成', error: '错误', cancelled: '已取消',
+      done: '完成 ✓', error: '错误 ⚠', cancelled: '已取消',
     }[state.value.status] || state.value.status));
     const progressPercent = computed(() => {
       const s = state.value;

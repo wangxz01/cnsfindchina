@@ -497,8 +497,11 @@ def run_scraper(urls: list[str], out_path: str | Path,
                          "issue_total": len(urls), "issue_url": issue_url})
             results = process_issue(page, issue_url, use_cache=use_cache, cb=cb)
             all_issues.append((issue_url, results))
-            write_excel(out_path, all_issues, columns=NATURE_COLUMNS,
+            actual_out = write_excel(out_path, all_issues, columns=NATURE_COLUMNS,
                         col_widths=[55, 55, 25, 14, 18, 60, 14, 10, 50])
+            if actual_out != out_path:
+                cb.log(f"[warn] 原文件被占用，实际写入: {actual_out}")
+                out_path = actual_out  # 后续 issue / all_done 用新路径
             cb.log(f"\n[issue {idx}] 完成，共 {len(results)} 篇；已写入 {out_path}")
             cb.on_state({"phase": "excel_written", "out_path": out_path,
                          "issue_url": issue_url})
@@ -512,8 +515,18 @@ def run_scraper(urls: list[str], out_path: str | Path,
 
         ctx.close()
 
-    cb.log(f"\n[done] 全部完成，结果写入 {out_path}")
-    cb.on_state({"phase": "all_done", "out_path": out_path})
+    real_count = sum(
+        1 for _, results in all_issues
+        for _, _, f in results
+        if f.get("title") and f["title"] not in ("[CF BLOCKED]", "[GOTO FAILED]")
+    )
+    if real_count == 0:
+        cb.log(f"\n[warn] 全部完成但 0 篇成功（可能 CF/cookie 墙未过或结构变化）")
+        cb.on_state({"phase": "all_skipped", "out_path": out_path,
+                     "reason": "0 篇文章抓取成功"})
+    else:
+        cb.log(f"\n[done] 全部完成（{real_count} 篇），结果写入 {out_path}")
+        cb.on_state({"phase": "all_done", "out_path": out_path})
     return all_issues
 
 
