@@ -417,6 +417,9 @@ def process_issue(page, issue_url: str, use_cache: bool = True,
         cb.log(f"        国家: {fields['first_author_country']}  "
                f"是否中国: {'是' if fields['is_china'] else '否'}")
 
+        # 让 cache 携带 section + issue_url，供"立即导出"按 issue 分组、按 section 分类
+        fields["section"] = section
+        fields["issue_url"] = issue_url
         if doi and fields.get("title") and fields["title"] not in ("[CF BLOCKED]", "[GOTO FAILED]"):
             save_to_cache(doi, fields)
 

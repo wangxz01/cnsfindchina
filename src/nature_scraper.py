@@ -43,6 +43,7 @@ from scraper_common import (
     save_to_cache as _common_save_cache,
     load_urls as _common_load_urls,
     default_out_path as _common_default_out,
+    safe_goto as _safe_goto,
     count_real_articles,
     DATA_DIR,
 )
@@ -383,10 +384,9 @@ def process_issue(page, issue_url: str, use_cache: bool = True,
     cb = cb or ScraperCallbacks()
     cb.log(f"\n[issue] 打开: {issue_url}")
     cb.on_state({"phase": "issue_start", "issue_url": issue_url})
-    try:
-        page.goto(issue_url, wait_until="domcontentloaded", timeout=60000)
-    except Exception as e:
-        cb.log(f"[warn] issue 页 goto 异常: {str(e)[:120]}")
+    if not _safe_goto(page, issue_url, cb, max_retries=2):
+        cb.log("[error] issue 页 goto 多次重试失败，跳过此 issue")
+        return []
     if not wait_until_cf_clear(page, target_url=issue_url, cb=cb):
         cb.log("[error] issue 页 CF/cookie 墙未通过，跳过此 issue")
         return []
@@ -438,16 +438,18 @@ def process_issue(page, issue_url: str, use_cache: bool = True,
         cb.log(f"        标题(list): {list_title[:80]}")
         rwait(1.5, 4.0)
         random_mouse_jitter(page, moves=2)
-        try:
-            page.goto(url, wait_until="domcontentloaded", timeout=60000)
-        except PWTimeout:
-            cb.log("        [warn] goto 超时，继续尝试解析")
-        except Exception as e:
-            msg = str(e)
-            if "ERR_ABORTED" in msg or "net::ERR_" in msg:
-                cb.log(f"        [warn] goto 被中断（{msg[:80]}），疑似 CF 拦截，进入手动处理")
-            else:
-                cb.log(f"        [warn] goto 异常: {msg[:120]}")
+        if not _safe_goto(page, url, cb, max_retries=2):
+            cb.log("        [error] goto 重试均失败，跳过此篇")
+            fields = {
+                "url": url, "title": "[GOTO FAILED]", "doi": "", "type": section,
+                "first_author": "", "first_aff": "", "first_author_country": "",
+                "is_china": False, "authors": [],
+            }
+            results.append((section, url, fields))
+            cb.on_state({"phase": "article_done", "url": url,
+                         "fields": fields, "blocked": True})
+            rwait(5.0, 10.0)
+            continue
 
         if not wait_until_cf_clear(page, target_url=url, cb=cb):
             cb.log(f"        [error] CF 未通过，本篇记为 [CF BLOCKED]")
@@ -490,6 +492,9 @@ def process_issue(page, issue_url: str, use_cache: bool = True,
         cb.log(f"        国家: {fields['first_author_country']}  "
                f"是否中国: {'是' if fields['is_china'] else '否'}")
 
+        # 让 cache 携带 section + issue_url，供"立即导出"按 issue 分组、按 section 分类
+        fields["section"] = section
+        fields["issue_url"] = issue_url
         # 只在拿到真实数据时写缓存
         if article_id and fields.get("title") and fields["title"] != "[CF BLOCKED]":
             save_to_cache(article_id, fields)
@@ -555,7 +560,7 @@ def run_scraper(urls: list[str], out_path: str | Path,
             results = process_issue(page, issue_url, use_cache=use_cache, cb=cb)
             all_issues.append((issue_url, results))
             actual_out = write_excel(out_path, all_issues, columns=NATURE_COLUMNS,
-                        col_widths=[55, 55, 25, 12, 18, 60, 14, 10, 50])
+                        col_widths=[55, 55, 25, 14, 18, 60, 14, 10, 50])
             if actual_out != out_path:
                 cb.log(f"[warn] 原文件被占用，实际写入: {actual_out}")
                 out_path = actual_out

@@ -461,26 +461,31 @@ def export_now(source: str = Query(...)):
     if not cfg.cache_dir.exists() or not any(cfg.cache_dir.glob("*.json")):
         raise HTTPException(status_code=404, detail=f"{source} 缓存为空，无可导出数据")
 
-    # 读所有 cache 文件，按 url 里的 issue 标识分组（这里简化：直接当一组写入单 sheet）
-    # 注意：cache 文件不含 issue_url 信息，只能按 source 全部合并到一个 sheet
-    # 取一个合成 issue key（实际 sheet 名按 source+日期）
+    # 按 issue_url 分组成多 sheet（与正常 run_scraper 输出一致）；
+    # section 优先 fields["section"]，回退 fields["type"]（Nature/Science 已有 type=section），
+    # 再回退空。旧 cache 既无 section 也无 issue_url → 全部落到 fallback 单 sheet。
+    from collections import defaultdict
     from excel_writer import write_excel
-    cached_items = []
+    groups: dict[str, list] = defaultdict(list)
     for f in sorted(cfg.cache_dir.glob("*.json")):
         try:
             d = json.loads(f.read_text(encoding="utf-8"))
-            cached_items.append(("", d.get("url", ""), d))
         except Exception:
             continue
+        issue = d.get("issue_url") or ""
+        section = d.get("section") or d.get("type") or ""
+        groups[issue].append((section, d.get("url", ""), d))
+
+    fallback_label = f"export ({source} cache)"
+    all_issues = [(iu or fallback_label, items) for iu, items in groups.items()]
+
     out_path = session.out_path or cfg.default_out()
     out_path = str(Path(out_path).resolve())
-    # 用一个虚拟 issue URL 作为 sheet 标题来源
-    virtual_issue = f"export ({source} cache)"
-    actual = write_excel(out_path, [(virtual_issue, cached_items)],
+    actual = write_excel(out_path, all_issues,
                          columns=cfg.columns, col_widths=cfg.col_widths)
     session.out_path = actual
     bus.broadcast({"type": "state", "source": source, "data": session.snapshot()})
-    return {"ok": True, "out_path": actual, "count": len(cached_items)}
+    return {"ok": True, "out_path": actual, "count": sum(len(it) for it in groups.values())}
 
 
 def main():

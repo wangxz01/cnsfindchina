@@ -34,6 +34,7 @@ from scraper_common import (
     save_to_cache as _common_save_cache,
     load_urls as _common_load_urls,
     default_out_path as _common_default_out,
+    safe_goto as _safe_goto,
     count_real_articles,
     DATA_DIR,
 )
@@ -354,7 +355,12 @@ def extract_article_list(page) -> list[tuple[str, str, str]]:
         if pii in seen:
             continue
         seen.add(pii)
-        cleaned.append((item.get("section", "").strip(), url, item.get("title", "").strip()))
+        section = item.get("section", "").strip()
+        title = item.get("title", "").strip()
+        # 过滤掉勘误（Author Correction / Publisher Correction），不算专业论文
+        if re.match(r"^(Author|Publisher)\s+Correction\s*:", title, re.IGNORECASE):
+            continue
+        cleaned.append((section, url, title))
     return cleaned
 
 
@@ -412,7 +418,7 @@ def _extract_from_html(html: str) -> dict:
     is_china = is_china_country(country)
 
     return {
-        "title": title, "doi": doi, "authors": authors, "first_aff": first_aff,
+        "title": title, "doi": doi, "type": "", "authors": authors, "first_aff": first_aff,
         "first_author": first_author,
         "first_author_country": country,
         "is_china": is_china,
@@ -519,10 +525,9 @@ def process_issue(page, issue_url: str, use_cache: bool = True,
     cb = cb or ScraperCallbacks()
     cb.log(f"\n[issue] 打开: {issue_url}")
     cb.on_state({"phase": "issue_start", "issue_url": issue_url})
-    try:
-        page.goto(issue_url, wait_until="domcontentloaded", timeout=60000)
-    except Exception as e:
-        cb.log(f"[warn] issue 页 goto 异常: {str(e)[:120]}")
+    if not _safe_goto(page, issue_url, cb, max_retries=2):
+        cb.log("[error] issue 页 goto 多次重试失败，跳过此 issue")
+        return []
     if not wait_until_cf_clear(page, target_url=issue_url, cb=cb):
         cb.log("[error] issue 页 CF 未通过，跳过此 issue")
         return []
@@ -574,22 +579,27 @@ def process_issue(page, issue_url: str, use_cache: bool = True,
         # 进文章前随机停顿 + 鼠标抖动
         rwait(1.5, 4.0)
         random_mouse_jitter(page, moves=random.randint(1, 3))
-        try:
-            page.goto(url, wait_until="domcontentloaded", timeout=60000)
-        except PWTimeout:
-            cb.log("        [warn] goto 超时，继续尝试解析")
-        except Exception as e:
-            msg = str(e)
-            if "ERR_ABORTED" in msg or "net::ERR_" in msg:
-                cb.log(f"        [warn] goto 被中断（{msg[:80]}），疑似 CF 拦截，进入手动处理")
-            else:
-                cb.log(f"        [warn] goto 异常: {msg[:120]}")
+        if not _safe_goto(page, url, cb, max_retries=2):
+            cb.log("        [error] goto 重试均失败，跳过此篇")
+            fields = {
+                "url": url, "title": "[GOTO FAILED]", "doi": pii, "type": section,
+                "first_author": "", "first_aff": "", "first_author_country": "",
+                "is_china": False, "authors": [],
+            }
+            results.append((section, url, fields))
+            cb.on_state({"phase": "article_done", "url": url,
+                         "fields": fields, "blocked": True})
+            rwait(5.0, 10.0)
+            continue
 
         # CF 检测 + 用户手动处理
         if not wait_until_cf_clear(page, target_url=url, cb=cb):
             cb.log(f"        [error] CF 未通过，本篇记为 [CF BLOCKED]（不写缓存，下次重试）")
-            fields = {"title": "[CF BLOCKED]", "doi": "", "authors": [],
-                      "first_aff": "", "url": url}
+            fields = {
+                "url": url, "title": "[CF BLOCKED]", "doi": pii, "type": section,
+                "first_author": "", "first_aff": "", "first_author_country": "",
+                "is_china": False, "authors": [],
+            }
             results.append((section, url, fields))
             cb.on_state({"phase": "article_done", "url": url,
                          "fields": fields, "blocked": True})
@@ -612,6 +622,9 @@ def process_issue(page, issue_url: str, use_cache: bool = True,
         human_pause(page, 0.5, 1.5)
 
         fields = extract_fields(page, url)
+        # 用 issue 页的 section 覆盖 type（与 Nature/Science 同口径）
+        if section:
+            fields["type"] = section
         # 疑似 CF 残留页：再过一次并重新解析
         if not fields["title"] or "are you a robot" in fields["title"].lower() \
            or "just a moment" in fields["title"].lower():
@@ -619,6 +632,8 @@ def process_issue(page, issue_url: str, use_cache: bool = True,
             if wait_until_cf_clear(page, target_url=url, cb=cb):
                 human_pause(page, 1.2, 2.8)
                 fields = extract_fields(page, url)
+                if section:
+                    fields["type"] = section
         results.append((section, url, fields))
 
         cb.log(f"        标题(art): {fields['title'][:80]}")
@@ -627,6 +642,9 @@ def process_issue(page, issue_url: str, use_cache: bool = True,
                f"{'; '.join(fields['authors'][:3])}{' ...' if len(fields['authors']) > 3 else ''}")
         cb.log(f"        首条单位:  {fields['first_aff'][:100]}")
 
+        # 让 cache 携带 section + issue_url，供"立即导出"按 issue 分组、按 section 分类
+        fields["section"] = section
+        fields["issue_url"] = issue_url
         # 只在拿到真实数据时写缓存；CF BLOCKED 不写
         if pii and fields.get("title") and fields["title"] != "[CF BLOCKED]":
             save_to_cache(pii, fields)
