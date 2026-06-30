@@ -1,8 +1,6 @@
 # 每行一个 Cell issue URL，# 开头为注释。程序会按顺序逐个抓取。
 # 示例（取消注释即可用）：
 https://www.sciencedirect.com/journal/cell/vol/189/issue/10
-https://www.sciencedirect.com/journal/cell/vol/189/issue/11
-https://www.sciencedirect.com/journal/cell/vol/189/issue/12
 # 多个 issue 示例：
 # https://www.sciencedirect.com/journal/cell/vol/189/issue/11
 # https://www.sciencedirect.com/journal/cell/vol/188/issue/24

@@ -15,11 +15,11 @@
 git clone https://github.com/wangxz01/cnsfindchina.git
 cd cnsfindchina
 
-# 2. 一键准备环境（装 Python 依赖 + Playwright Chromium + 建工作目录）
-# Windows：双击 setup.bat 或 cmd 里 setup.bat
-# macOS / Linux / Git Bash：bash setup.sh
+# 2. 装依赖
+pip install -r requirements.txt
+playwright install chromium
 
-# 3. 启动
+# 3. 启动（可写到定时任务/启动项里）
 python unified_web.py
 # 浏览器打开 http://127.0.0.1:8000/
 ```
@@ -34,8 +34,6 @@ python unified_web.py
 这些都已在 `.gitignore` 中，clone 进来的目录是干净的源码。
 
 ## 安装（手动方式）
-
-如果不想用 setup 脚本：
 
 ```bash
 pip install -r requirements.txt
