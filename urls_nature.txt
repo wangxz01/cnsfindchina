@@ -1,0 +1,12 @@
+# 每行一个 Nature issue URL，# 开头为注释。程序会按顺序逐个抓取。
+# 只处理 Articles + Perspective（s41586- 研究论文）。
+https://www.nature.com/nature/volumes/653/issues/8113
+https://www.nature.com/nature/volumes/653/issues/8114
+https://www.nature.com/nature/volumes/653/issues/8115
+https://www.nature.com/nature/volumes/653/issues/8116
+https://www.nature.com/nature/volumes/654/issues/8117
+https://www.nature.com/nature/volumes/654/issues/8118
+https://www.nature.com/nature/volumes/654/issues/8119
+# 更多示例：
+# https://www.nature.com/nature/volumes/653/issues/8112
+# https://www.nature.com/nature/volumes/653/issues/8111

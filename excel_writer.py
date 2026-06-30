@@ -5,7 +5,7 @@
   Row 1, Col A                 = issue URL
   之后按 section 出现顺序：
     分类名独占一行（Col A）
-    每篇文章一行：[URL | 标题 | DOI | 作者(分号拼接) | 首条 affiliation]
+    每篇文章一行：按 columns schema 渲染
 """
 import re
 import time
@@ -15,8 +15,33 @@ import openpyxl
 from openpyxl.utils import get_column_letter
 
 
+# 列 schema：(表头, 取值键或 callable)
+# - 字符串键：直接从 fields dict 取；特殊键 "authors_joined" 自动 join
+# - callable：fields dict -> 单元格值
+DEFAULT_COLUMNS = [
+    ("URL", "url"),
+    ("标题", "title"),
+    ("DOI", "doi"),
+    ("作者", "authors_joined"),
+    ("首条单位", "first_aff"),
+]
+
+NATURE_COLUMNS = [
+    ("URL", "url"),
+    ("标题", "title"),
+    ("DOI", "doi"),
+    ("类型", "type"),
+    ("一作", "first_author"),
+    ("一作单位", "first_aff"),
+    ("一作国家", "first_author_country"),
+    ("是否中国", "is_china_label"),
+    ("作者列表", "authors_joined"),
+]
+
+
 def _sheet_name_from_url(url: str) -> str:
-    m = re.search(r"/vol/(\d+)/issue/(\d+)", url)
+    # Cell 格式：/vol/X/issue/Y
+    m = re.search(r"/vol(?:umes)?/(\d+)/issues?/(\d+)", url)
     if m:
         return f"v{m.group(1)}-i{m.group(2)}"
     parts = url.rstrip("/").split("/")
@@ -24,7 +49,18 @@ def _sheet_name_from_url(url: str) -> str:
     return name[:31]  # Excel sheet 名最长 31 字符
 
 
-def write_one_sheet(wb, issue_url: str, results: list) -> None:
+def _cell_value(key, f: dict):
+    if callable(key):
+        return key(f)
+    if key == "authors_joined":
+        return "; ".join(f.get("authors", []))
+    if key == "is_china_label":
+        return "是" if f.get("is_china") else "否"
+    return f.get(key, "")
+
+
+def write_one_sheet(wb, issue_url: str, results: list,
+                    columns=DEFAULT_COLUMNS, col_widths=None) -> None:
     ws = wb.create_sheet(_sheet_name_from_url(issue_url))
     ws.append([issue_url])
     last_section = None
@@ -32,24 +68,20 @@ def write_one_sheet(wb, issue_url: str, results: list) -> None:
         if section != last_section:
             ws.append([section])
             last_section = section
-        ws.append([
-            url,
-            f.get("title", ""),
-            f.get("doi", ""),
-            "; ".join(f.get("authors", [])),
-            f.get("first_aff", ""),
-        ])
-    widths = [60, 60, 30, 40, 60]
+        ws.append([_cell_value(k, f) for _, k in columns])
+
+    widths = col_widths or [60] * len(columns)
     for i, w in enumerate(widths, start=1):
         ws.column_dimensions[get_column_letter(i)].width = w
 
 
-def write_excel(out_path: str, all_issues: list) -> None:
+def write_excel(out_path: str, all_issues: list,
+                columns=DEFAULT_COLUMNS, col_widths=None) -> None:
     """all_issues: [(issue_url, results), ...]。每个 issue 一个 sheet。"""
     wb = openpyxl.Workbook()
     wb.remove(wb.active)  # 删除默认 sheet
     for issue_url, results in all_issues:
-        write_one_sheet(wb, issue_url, results)
+        write_one_sheet(wb, issue_url, results, columns=columns, col_widths=col_widths)
 
     try:
         wb.save(out_path)
@@ -59,4 +91,5 @@ def write_excel(out_path: str, all_issues: list) -> None:
         alt = str(Path(out_path).with_suffix(f".{ts}.xlsx"))
         print(f"[warn] {out_path} 被占用，改写到: {alt}")
         wb.save(alt)
+
 

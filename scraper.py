@@ -26,7 +26,16 @@ from urllib.parse import urljoin
 
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
-from excel_writer import write_excel
+from excel_writer import write_excel, NATURE_COLUMNS
+
+
+# 国别判定 lazy import（避免与 nature_scraper 循环 import）
+def _country_helpers():
+    try:
+        from nature_scraper import parse_country, is_china_country
+        return parse_country, is_china_country
+    except ImportError:
+        return (lambda aff: ""), (lambda c: False)
 
 # ---------- 常量 ----------
 
@@ -39,6 +48,32 @@ WANTED_SECTIONS = {"Articles", "Short Articles", "Resources"}
 PROFILE_DIR = Path(__file__).parent / "browser_profile"
 URLS_FILE = Path(__file__).parent / "urls.txt"
 CACHE_DIR = Path(__file__).parent / "cache"
+
+
+# ---------- Callbacks ----------
+# 把 print/input 抽象成 hook，CLI 用默认实现，Web 服务子类化覆盖。
+
+
+class ScraperCallbacks:
+    """默认实现：终端 print + input。Web 模式请子类化覆盖 log/cf_wait/is_cancelled/on_state。"""
+
+    def log(self, msg: str) -> None:
+        """普通日志输出。"""
+        print(msg)
+
+    def cf_wait(self, target_url: str, current_url: str,
+                attempt: int, max_attempts: int) -> bool:
+        """CF 触发时阻塞等待用户处理。返回 True 表示用户已处理；False 表示中止。"""
+        input(f">>> 完成后回到此终端按 Enter（第 {attempt}/{max_attempts} 次）: ")
+        return True
+
+    def is_cancelled(self) -> bool:
+        """是否被外部取消（如 Web 端按了停止）。"""
+        return False
+
+    def on_state(self, state: dict) -> None:
+        """结构化状态变更（phase + 当前进度）。CLI 默认忽略；Web 端转发给前端。"""
+        pass
 
 # ---------- 随机化辅助（避免访问节律过于规律导致 IP 被封） ----------
 
@@ -140,7 +175,8 @@ def is_cloudflare(page) -> bool:
     return "cdn-cgi/challenge" in (page.url or "").lower()
 
 
-def wait_until_cf_clear(page, target_url: str | None = None, max_attempts: int = 3) -> bool:
+def wait_until_cf_clear(page, target_url: str | None = None,
+                        max_attempts: int = 3, cb: ScraperCallbacks | None = None) -> bool:
     """检测并处理 CF；最多提示用户 max_attempts 次。返回是否已通过。
 
     设计要点：
@@ -148,23 +184,34 @@ def wait_until_cf_clear(page, target_url: str | None = None, max_attempts: int =
     - 只检测 + 提示 + 等用户手动操作 + 再检测
     - 用户应在浏览器中手动让页面停在目标 URL 上
     """
+    cb = cb or ScraperCallbacks()
     if not is_cloudflare(page):
         return True
 
     for attempt in range(1, max_attempts + 1):
-        print(f"\n[Cloudflare] 检测到人机验证挑战（第 {attempt}/{max_attempts} 次）。")
+        cb.log(f"\n[Cloudflare] 检测到人机验证挑战（第 {attempt}/{max_attempts} 次）。")
         if target_url:
-            print(f"[Cloudflare] 目标 URL: {target_url}")
+            cb.log(f"[Cloudflare] 目标 URL: {target_url}")
         try:
             cur = page.url
         except Exception:
             cur = "(unknown)"
-        print(f"[Cloudflare] 当前 URL: {cur}")
-        print("[Cloudflare] 请在浏览器窗口中：")
-        print("  1) 完成人机验证（勾选复选框或等自动放行）")
-        print("  2) 必要时手动把地址栏改成目标 URL 并回车")
-        print("  3) 确认浏览器停在目标文章页（非 CF 挑战页）")
-        input(f">>> 完成后回到此终端按 Enter（第 {attempt}/{max_attempts} 次）: ")
+        cb.log(f"[Cloudflare] 当前 URL: {cur}")
+        cb.log("[Cloudflare] 请在浏览器窗口中：")
+        cb.log("  1) 完成人机验证（勾选复选框或等自动放行）")
+        cb.log("  2) 必要时手动把地址栏改成目标 URL 并回车")
+        cb.log("  3) 确认浏览器停在目标文章页（非 CF 挑战页）")
+        cb.on_state({
+            "phase": "cf_blocked",
+            "target": target_url or "",
+            "current": cur,
+            "attempt": attempt,
+            "max_attempts": max_attempts,
+        })
+        if not cb.cf_wait(target_url or "", cur, attempt, max_attempts):
+            return False
+        if cb.is_cancelled():
+            return False
 
         # 给页面一点时间稳定
         time.sleep(1.5)
@@ -174,10 +221,10 @@ def wait_until_cf_clear(page, target_url: str | None = None, max_attempts: int =
             pass
 
         if not is_cloudflare(page):
-            print("[Cloudflare] 已通过。")
+            cb.log("[Cloudflare] 已通过。")
             return True
 
-    print("[Cloudflare] 多次尝试后仍未通过。")
+    cb.log("[Cloudflare] 多次尝试后仍未通过。")
     return False
 
 
@@ -285,7 +332,18 @@ def _extract_from_html(html: str) -> dict:
         if m:
             first_aff = m.group(1)
 
-    return {"title": title, "doi": doi, "authors": authors, "first_aff": first_aff}
+    # 一作 + 国别（与 Nature/Science 同口径）
+    first_author = authors[0] if authors else ""
+    parse_country, is_china_country = _country_helpers()
+    country = parse_country(first_aff)
+    is_china = is_china_country(country)
+
+    return {
+        "title": title, "doi": doi, "authors": authors, "first_aff": first_aff,
+        "first_author": first_author,
+        "first_author_country": country,
+        "is_china": is_china,
+    }
 
 
 def _click_show_more_js(page) -> bool:
@@ -403,68 +461,84 @@ def load_urls() -> list[str]:
     return urls
 
 
-def process_issue(page, issue_url: str, use_cache: bool = True) -> list:
+def process_issue(page, issue_url: str, use_cache: bool = True,
+                  cb: ScraperCallbacks | None = None) -> list:
     """处理单个 issue：返回该 issue 的 results 列表 [(section, url, fields), ...]。"""
-    print(f"\n[issue] 打开: {issue_url}")
+    cb = cb or ScraperCallbacks()
+    cb.log(f"\n[issue] 打开: {issue_url}")
+    cb.on_state({"phase": "issue_start", "issue_url": issue_url})
     try:
         page.goto(issue_url, wait_until="domcontentloaded", timeout=60000)
     except Exception as e:
-        print(f"[warn] issue 页 goto 异常: {str(e)[:120]}")
-    if not wait_until_cf_clear(page, target_url=issue_url):
-        print("[error] issue 页 CF 未通过，跳过此 issue")
+        cb.log(f"[warn] issue 页 goto 异常: {str(e)[:120]}")
+    if not wait_until_cf_clear(page, target_url=issue_url, cb=cb):
+        cb.log("[error] issue 页 CF 未通过，跳过此 issue")
         return []
 
     try:
         page.wait_for_selector("a.article-content-title", timeout=20000)
     except PWTimeout:
-        print("[warn] 未找到文章链接，可能 CF 未真正通过或页面结构变化。")
+        cb.log("[warn] 未找到文章链接，可能 CF 未真正通过或页面结构变化。")
         return []
 
     all_articles = extract_article_list(page)
-    print(f"[*] 共发现 {len(all_articles)} 篇文章（全部 section）")
+    cb.log(f"[*] 共发现 {len(all_articles)} 篇文章（全部 section）")
     targets = [t for t in all_articles if t[0] in WANTED_SECTIONS]
-    print(f"[*] 过滤到 Articles/Short Articles/Resources：{len(targets)} 篇")
+    cb.log(f"[*] 过滤到 Articles/Short Articles/Resources：{len(targets)} 篇")
     for sec, url, ttl in targets:
-        print(f"      - [{sec}] {ttl[:60]}")
+        cb.log(f"      - [{sec}] {ttl[:60]}")
+    cb.on_state({"phase": "issue_plan", "issue_url": issue_url,
+                 "targets": [(s, u, t) for s, u, t in targets]})
 
     results = []
     total = len(targets)
     cache_hits = 0
     for i, (section, url, list_title) in enumerate(targets, start=1):
+        if cb.is_cancelled():
+            cb.log("[*] 收到取消信号，停止当前 issue")
+            break
         m = re.search(r"/pii/(S\d+)", url)
         pii = m.group(1) if m else ""
+
+        cb.on_state({"phase": "article_start", "issue_url": issue_url,
+                     "article_idx": i, "article_total": total,
+                     "section": section, "url": url, "title": list_title})
 
         # 缓存命中：直接用，不访问网络
         if use_cache and pii:
             cached = load_from_cache(pii)
             if cached:
                 cache_hits += 1
-                print(f"\n[{i}/{total}] [cache] {list_title[:70]}")
+                cb.log(f"\n[{i}/{total}] [cache] {list_title[:70]}")
                 results.append((section, url, cached))
+                cb.on_state({"phase": "article_done", "url": url,
+                             "fields": cached, "cached": True})
                 continue
 
-        print(f"\n[{i}/{total}] 打开: {url}")
-        print(f"        标题(list): {list_title[:80]}")
+        cb.log(f"\n[{i}/{total}] 打开: {url}")
+        cb.log(f"        标题(list): {list_title[:80]}")
         # 进文章前随机停顿 + 鼠标抖动
         rwait(1.5, 4.0)
         random_mouse_jitter(page, moves=random.randint(1, 3))
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=60000)
         except PWTimeout:
-            print("        [warn] goto 超时，继续尝试解析")
+            cb.log("        [warn] goto 超时，继续尝试解析")
         except Exception as e:
             msg = str(e)
             if "ERR_ABORTED" in msg or "net::ERR_" in msg:
-                print(f"        [warn] goto 被中断（{msg[:80]}），疑似 CF 拦截，进入手动处理")
+                cb.log(f"        [warn] goto 被中断（{msg[:80]}），疑似 CF 拦截，进入手动处理")
             else:
-                print(f"        [warn] goto 异常: {msg[:120]}")
+                cb.log(f"        [warn] goto 异常: {msg[:120]}")
 
         # CF 检测 + 用户手动处理
-        if not wait_until_cf_clear(page, target_url=url):
-            print(f"        [error] CF 未通过，本篇记为 [CF BLOCKED]（不写缓存，下次重试）")
+        if not wait_until_cf_clear(page, target_url=url, cb=cb):
+            cb.log(f"        [error] CF 未通过，本篇记为 [CF BLOCKED]（不写缓存，下次重试）")
             fields = {"title": "[CF BLOCKED]", "doi": "", "authors": [],
                       "first_aff": "", "url": url}
             results.append((section, url, fields))
+            cb.on_state({"phase": "article_done", "url": url,
+                         "fields": fields, "blocked": True})
             rwait(5.0, 10.0)
             continue
 
@@ -487,38 +561,97 @@ def process_issue(page, issue_url: str, use_cache: bool = True) -> list:
         # 疑似 CF 残留页：再过一次并重新解析
         if not fields["title"] or "are you a robot" in fields["title"].lower() \
            or "just a moment" in fields["title"].lower():
-            print("        [warn] 解析失败（疑似 CF 页），再次进入手动处理")
-            if wait_until_cf_clear(page, target_url=url):
+            cb.log("        [warn] 解析失败（疑似 CF 页），再次进入手动处理")
+            if wait_until_cf_clear(page, target_url=url, cb=cb):
                 human_pause(page, 1.2, 2.8)
                 fields = extract_fields(page, url)
         results.append((section, url, fields))
 
-        print(f"        标题(art): {fields['title'][:80]}")
-        print(f"        DOI:       {fields['doi']}")
-        print(f"        作者数:    {len(fields['authors'])}  "
-              f"{'; '.join(fields['authors'][:3])}{' ...' if len(fields['authors']) > 3 else ''}")
-        print(f"        首条单位:  {fields['first_aff'][:100]}")
+        cb.log(f"        标题(art): {fields['title'][:80]}")
+        cb.log(f"        DOI:       {fields['doi']}")
+        cb.log(f"        作者数:    {len(fields['authors'])}  "
+               f"{'; '.join(fields['authors'][:3])}{' ...' if len(fields['authors']) > 3 else ''}")
+        cb.log(f"        首条单位:  {fields['first_aff'][:100]}")
 
         # 只在拿到真实数据时写缓存；CF BLOCKED 不写
         if pii and fields.get("title") and fields["title"] != "[CF BLOCKED]":
             save_to_cache(pii, fields)
 
+        cb.on_state({"phase": "article_done", "url": url,
+                     "fields": fields, "cached": False})
+
         # 文章间随机停顿；每 5-8 篇插入一次长歇
         if i % random.randint(5, 8) == 0:
             pause = random.uniform(45.0, 120.0)
-            print(f"        [*] 第 {i} 篇完成，长歇 {pause:.0f}s 模拟阅读间歇...")
-            time.sleep(pause)
+            cb.log(f"        [*] 第 {i} 篇完成，长歇 {pause:.0f}s 模拟阅读间歇...")
+            for _ in range(int(pause)):
+                if cb.is_cancelled():
+                    break
+                time.sleep(1)
         else:
             rwait(6.0, 15.0)
 
     if cache_hits:
-        print(f"\n[issue] 缓存命中 {cache_hits}/{total} 篇（未访问网络）")
+        cb.log(f"\n[issue] 缓存命中 {cache_hits}/{total} 篇（未访问网络）")
+    cb.on_state({"phase": "issue_done", "issue_url": issue_url, "count": len(results)})
     return results
 
 
 def default_out_path() -> str:
     """默认输出文件名按日期：cell_YYYY-MM-DD.xlsx"""
     return f"cell_{date.today().isoformat()}.xlsx"
+
+
+def run_scraper(urls: list[str], out_path: str | Path,
+                cb: ScraperCallbacks | None = None,
+                use_cache: bool = True, headless: bool = False) -> list:
+    """主抓取流程（CLI 与 Web 共用）。
+
+    返回 all_issues: [(issue_url, [(section, url, fields), ...]), ...]
+    """
+    cb = cb or ScraperCallbacks()
+    out_path = str(out_path)
+    all_issues: list[tuple[str, list]] = []
+
+    with sync_playwright() as p:
+        ctx = p.chromium.launch_persistent_context(
+            user_data_dir=str(PROFILE_DIR),
+            headless=headless,
+            viewport={"width": 1366, "height": 900},
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        ctx.add_init_script(
+            "() => { Object.defineProperty(navigator, 'webdriver', {get: () => undefined}); }"
+        )
+        page = ctx.new_page()
+
+        for idx, issue_url in enumerate(urls, start=1):
+            if cb.is_cancelled():
+                cb.log("[*] 收到取消信号，停止整个抓取流程")
+                break
+            cb.log(f"\n========== issue {idx}/{len(urls)} ==========")
+            cb.on_state({"phase": "issue_progress", "issue_idx": idx,
+                         "issue_total": len(urls), "issue_url": issue_url})
+            results = process_issue(page, issue_url, use_cache=use_cache, cb=cb)
+            all_issues.append((issue_url, results))
+            write_excel(out_path, all_issues, columns=NATURE_COLUMNS,
+                        col_widths=[55, 55, 25, 14, 18, 60, 14, 10, 50])
+            cb.log(f"\n[issue {idx}] 完成，共 {len(results)} 篇；已写入 {out_path}")
+            cb.on_state({"phase": "excel_written", "out_path": out_path,
+                         "issue_url": issue_url})
+            if idx < len(urls):
+                pause = random.uniform(20.0, 60.0)
+                cb.log(f"[*] issue 间长歇 {pause:.0f}s ...")
+                for _ in range(int(pause)):
+                    if cb.is_cancelled():
+                        break
+                    time.sleep(1)
+
+        ctx.close()
+
+    cb.log(f"\n[done] 全部完成，结果写入 {out_path}")
+    cb.on_state({"phase": "all_done", "out_path": out_path})
+    return all_issues
 
 
 def main() -> int:
@@ -533,37 +666,7 @@ def main() -> int:
     out_path = Path(args.out if args.out else default_out_path()).resolve()
     urls = load_urls()
     print(f"[*] 从 urls.txt 读到 {len(urls)} 个 issue URL；use_cache={not args.fresh}")
-
-    all_issues: list[tuple[str, list]] = []
-
-    with sync_playwright() as p:
-        ctx = p.chromium.launch_persistent_context(
-            user_data_dir=str(PROFILE_DIR),
-            headless=args.headless,
-            viewport={"width": 1366, "height": 900},
-            args=["--disable-blink-features=AutomationControlled"],
-        )
-        ctx.add_init_script(
-            "() => { Object.defineProperty(navigator, 'webdriver', {get: () => undefined}); }"
-        )
-        page = ctx.new_page()
-
-        for idx, issue_url in enumerate(urls, start=1):
-            print(f"\n========== issue {idx}/{len(urls)} ==========")
-            results = process_issue(page, issue_url, use_cache=not args.fresh)
-            all_issues.append((issue_url, results))
-            # 每个 issue 完成后写一次中间 Excel
-            write_excel(str(out_path), all_issues)
-            print(f"\n[issue {idx}] 完成，共 {len(results)} 篇；已写入 {out_path}")
-            # issue 之间随机长停顿
-            if idx < len(urls):
-                pause = random.uniform(20.0, 60.0)
-                print(f"[*] issue 间长歇 {pause:.0f}s ...")
-                time.sleep(pause)
-
-        ctx.close()
-
-    print(f"\n[done] 全部完成，结果写入 {out_path}")
+    run_scraper(urls, out_path, use_cache=not args.fresh, headless=args.headless)
     return 0
 
 
