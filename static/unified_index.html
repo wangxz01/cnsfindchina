@@ -401,6 +401,10 @@ createApp({
     function pushLog(src, msg) {
       // 只为当前 source 触发响应式追加；其它 source 静默累积
       logsBySource[src].push(msg);
+      // 截断：每个 source 最多保留 1000 条，防止长跑内存膨胀
+      if (logsBySource[src].length > 1000) {
+        logsBySource[src].splice(0, logsBySource[src].length - 1000);
+      }
     }
 
     // ---- SSE ----
@@ -414,6 +418,10 @@ createApp({
 
         if (d.type === 'log') {
           logsBySource[src].push(d.data);
+          // 截断：每个 source 最多 1000 条
+          if (logsBySource[src].length > 1000) {
+            logsBySource[src].splice(0, logsBySource[src].length - 1000);
+          }
           // 只为当前 source 自动滚到底
           if (src === currentSource.value) {
             nextTick(() => {

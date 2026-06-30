@@ -182,8 +182,8 @@ class WebCallbacks(ScraperCallbacks):
                      "attempt": attempt, "max_attempts": max_attempts},
         )
         self.session.cf_event.clear()
-        # 只等本 session 的 cf_event；其他 session 的 cf_resumed 不会影响这里
-        while not self.session.cf_event.wait(timeout=2.0):
+        # 0.3s 轮询 stop_event，让"停止"按钮尽快生效（之前是 2s）
+        while not self.session.cf_event.wait(timeout=0.3):
             if self.session.stop_event.is_set():
                 return False
         return not self.session.stop_event.is_set()

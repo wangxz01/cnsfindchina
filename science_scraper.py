@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import re
 import sys
 import time
@@ -38,6 +39,15 @@ from scraper import (
 )
 from nature_scraper import parse_country, is_china_country  # 国别判定逻辑完全一致
 from excel_writer import write_excel, NATURE_COLUMNS  # 列定义相同
+# 共用辅助（cache / urls / 默认输出 / 计数）；safe_goto 通过 _safe_goto 包装器转发
+from scraper_common import (
+    cache_path as _common_cache_path,
+    load_from_cache as _common_load_cache,
+    save_to_cache as _common_save_cache,
+    load_urls as _common_load_urls,
+    default_out_path as _common_default_out,
+    count_real_articles,
+)
 
 BASE = "https://www.science.org"
 # 只处理 Research Articles（专业论文）；Perspectives 是评论性短文，不算专业论文
@@ -239,50 +249,24 @@ def extract_fields(page, article_url: str) -> dict:
 
 
 def _safe_goto(page, url: str, cb: ScraperCallbacks, max_retries: int = 2) -> bool:
-    """goto 重试：Science.org 在快速连续访问时容易超时/被限速。"""
-    for attempt in range(max_retries):
-        try:
-            page.goto(url, wait_until="domcontentloaded", timeout=60000)
-            return True
-        except PWTimeout:
-            cb.log(f"        [warn] goto 超时（尝试 {attempt+1}/{max_retries}）")
-        except Exception as e:
-            msg = str(e)
-            if "ERR_ABORTED" in msg or "net::ERR_" in msg:
-                cb.log(f"        [warn] goto 中断（尝试 {attempt+1}/{max_retries}, {msg[:60]}）")
-            else:
-                cb.log(f"        [warn] goto 异常（尝试 {attempt+1}/{max_retries}）: {msg[:100]}")
-        if attempt < max_retries - 1:
-            wait_s = 15 * (attempt + 1)
-            cb.log(f"        [*] 等待 {wait_s}s 后重试...")
-            time.sleep(wait_s)
-    return False
+    """goto 重试：转发到 scraper_common（避免在文件内重复实现）。"""
+    from scraper_common import safe_goto
+    return safe_goto(page, url, cb, max_retries)
 
 
-# ---------- 缓存 ----------
+# ---------- 缓存（薄包装到 scraper_common） ----------
 
 
 def cache_path(doi: str) -> Path:
-    # DOI 含 /，用 _ 替
-    safe = doi.replace("/", "_")
-    return CACHE_DIR / f"{safe}.json"
+    return _common_cache_path(CACHE_DIR, doi)
 
 
 def load_from_cache(doi: str) -> dict | None:
-    p = cache_path(doi)
-    if not p.exists():
-        return None
-    try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except Exception:
-        return None
+    return _common_load_cache(CACHE_DIR, doi)
 
 
 def save_to_cache(doi: str, fields: dict) -> None:
-    CACHE_DIR.mkdir(exist_ok=True)
-    cache_path(doi).write_text(
-        json.dumps(fields, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    _common_save_cache(CACHE_DIR, doi, fields)
 
 
 # ---------- issue 处理 ----------
@@ -431,9 +415,9 @@ def process_issue(page, issue_url: str, use_cache: bool = True,
 
         # 长间隔（Science 比 Nature 更敏感，拉长到 12-25s，每 4 篇长歇）
         if i % 4 == 0:
-            sleep_dur = 60 + (hash(doi) % 60)
+            sleep_dur = random.randint(60, 120)
             cb.log(f"        [*] 第 {i} 篇完成，长歇 {sleep_dur}s...")
-            for _ in range(int(sleep_dur)):
+            for _ in range(sleep_dur):
                 if cb.is_cancelled():
                     break
                 time.sleep(1)
@@ -450,23 +434,11 @@ def process_issue(page, issue_url: str, use_cache: bool = True,
 
 
 def default_out_path() -> str:
-    return f"science_{date.today().isoformat()}.xlsx"
+    return _common_default_out("science")
 
 
 def load_urls() -> list[str]:
-    if not URLS_FILE.exists():
-        print(f"[error] 未找到 {URLS_FILE}。")
-        sys.exit(2)
-    urls = []
-    for ln in URLS_FILE.read_text(encoding="utf-8").splitlines():
-        s = ln.strip()
-        if not s or s.startswith("#"):
-            continue
-        urls.append(s)
-    if not urls:
-        print(f"[error] {URLS_FILE} 中没有有效 URL。")
-        sys.exit(2)
-    return urls
+    return _common_load_urls(URLS_FILE)
 
 
 def run_scraper(urls: list[str], out_path: str | Path,
@@ -506,7 +478,7 @@ def run_scraper(urls: list[str], out_path: str | Path,
             cb.on_state({"phase": "excel_written", "out_path": out_path,
                          "issue_url": issue_url})
             if idx < len(urls):
-                pause = 30 + (hash(issue_url) % 30)
+                pause = random.randint(30, 60)
                 cb.log(f"[*] issue 间长歇 {pause}s ...")
                 for _ in range(pause):
                     if cb.is_cancelled():
@@ -515,11 +487,7 @@ def run_scraper(urls: list[str], out_path: str | Path,
 
         ctx.close()
 
-    real_count = sum(
-        1 for _, results in all_issues
-        for _, _, f in results
-        if f.get("title") and f["title"] not in ("[CF BLOCKED]", "[GOTO FAILED]")
-    )
+    real_count = count_real_articles(all_issues)
     if real_count == 0:
         cb.log(f"\n[warn] 全部完成但 0 篇成功（可能 CF/cookie 墙未过或结构变化）")
         cb.on_state({"phase": "all_skipped", "out_path": out_path,

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import re
 import sys
 import time
@@ -35,6 +36,15 @@ from scraper import (
     detect_cf_in_html, is_cloudflare, wait_until_cf_clear,
 )
 from excel_writer import write_excel, NATURE_COLUMNS
+# 共用辅助
+from scraper_common import (
+    cache_path as _common_cache_path,
+    load_from_cache as _common_load_cache,
+    save_to_cache as _common_save_cache,
+    load_urls as _common_load_urls,
+    default_out_path as _common_default_out,
+    count_real_articles,
+)
 
 
 # ---------- 常量 ----------
@@ -127,7 +137,7 @@ def parse_country(affiliation: str) -> str:
     规则：
     1. 取逗号分隔的最后一个非空 segment（多数单位末段就是国家）
     2. 清洗后与 _COUNTRY_ALIASES 匹配
-    3. 匹配不到则返回原文末段（人工 review）
+    3. 匹配不到则返回原文末段加 "?" 前缀（标记未识别，方便人工 review）
     """
     if not affiliation:
         return ""
@@ -144,8 +154,8 @@ def parse_country(affiliation: str) -> str:
         # 也尝试整段去空格的常见变体
         if "china" in key and "taiwan" not in key and "hong" not in key and "macau" not in key:
             return "China"
-    # 兜底：返回最后一段原文
-    return parts[-1]
+    # 兜底：返回最后一段原文，加 "?" 前缀让 Excel 一眼看出未识别
+    return f"?{parts[-1]}"
 
 
 def is_china_country(country: str) -> bool:
@@ -344,24 +354,15 @@ def extract_fields(page, article_url: str) -> dict:
 
 
 def cache_path(article_id: str) -> Path:
-    return CACHE_DIR / f"{article_id}.json"
+    return _common_cache_path(CACHE_DIR, article_id)
 
 
 def load_from_cache(article_id: str) -> dict | None:
-    p = cache_path(article_id)
-    if not p.exists():
-        return None
-    try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except Exception:
-        return None
+    return _common_load_cache(CACHE_DIR, article_id)
 
 
 def save_to_cache(article_id: str, fields: dict) -> None:
-    CACHE_DIR.mkdir(exist_ok=True)
-    cache_path(article_id).write_text(
-        json.dumps(fields, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    _common_save_cache(CACHE_DIR, article_id, fields)
 
 
 # ---------- issue 处理 ----------
@@ -506,23 +507,11 @@ def process_issue(page, issue_url: str, use_cache: bool = True,
 
 
 def default_out_path() -> str:
-    return f"nature_{date.today().isoformat()}.xlsx"
+    return _common_default_out("nature")
 
 
 def load_urls() -> list[str]:
-    if not URLS_FILE.exists():
-        print(f"[error] 未找到 {URLS_FILE}。")
-        sys.exit(2)
-    urls = []
-    for ln in URLS_FILE.read_text(encoding="utf-8").splitlines():
-        s = ln.strip()
-        if not s or s.startswith("#"):
-            continue
-        urls.append(s)
-    if not urls:
-        print(f"[error] {URLS_FILE} 中没有有效 URL。")
-        sys.exit(2)
-    return urls
+    return _common_load_urls(URLS_FILE)
 
 
 def run_scraper(urls: list[str], out_path: str | Path,
@@ -562,7 +551,7 @@ def run_scraper(urls: list[str], out_path: str | Path,
             cb.on_state({"phase": "excel_written", "out_path": out_path,
                          "issue_url": issue_url})
             if idx < len(urls):
-                pause = 30 + (hash(issue_url) % 30)
+                pause = random.randint(30, 60)
                 cb.log(f"[*] issue 间长歇 {pause}s ...")
                 for _ in range(pause):
                     if cb.is_cancelled():
@@ -571,11 +560,7 @@ def run_scraper(urls: list[str], out_path: str | Path,
 
         ctx.close()
 
-    real_count = sum(
-        1 for _, results in all_issues
-        for _, _, f in results
-        if f.get("title") and f["title"] not in ("[CF BLOCKED]", "[GOTO FAILED]")
-    )
+    real_count = count_real_articles(all_issues)
     if real_count == 0:
         cb.log(f"\n[warn] 全部完成但 0 篇成功（可能 CF/cookie 墙未过或结构变化）")
         cb.on_state({"phase": "all_skipped", "out_path": out_path,

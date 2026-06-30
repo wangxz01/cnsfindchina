@@ -27,6 +27,15 @@ from urllib.parse import urljoin
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 from excel_writer import write_excel, NATURE_COLUMNS
+# 共用辅助（避免与 scraper_common 循环 import：scraper_common 用 TYPE_CHECKING 引用本模块）
+from scraper_common import (
+    cache_path as _common_cache_path,
+    load_from_cache as _common_load_cache,
+    save_to_cache as _common_save_cache,
+    load_urls as _common_load_urls,
+    default_out_path as _common_default_out,
+    count_real_articles,
+)
 
 
 # 国别判定 lazy import（避免与 nature_scraper 循环 import）
@@ -481,41 +490,20 @@ def extract_fields(page, article_url: str) -> dict:
 
 
 def cache_path(pii: str) -> Path:
-    return CACHE_DIR / f"{pii}.json"
+    return _common_cache_path(CACHE_DIR, pii)
 
 
 def load_from_cache(pii: str) -> dict | None:
-    p = cache_path(pii)
-    if not p.exists():
-        return None
-    try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except Exception:
-        return None
+    return _common_load_cache(CACHE_DIR, pii)
 
 
 def save_to_cache(pii: str, fields: dict) -> None:
-    CACHE_DIR.mkdir(exist_ok=True)
-    cache_path(pii).write_text(
-        json.dumps(fields, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    _common_save_cache(CACHE_DIR, pii, fields)
 
 
 def load_urls() -> list[str]:
     """从同目录 urls.txt 读取 issue URL 列表，# 开头为注释，空行跳过。"""
-    if not URLS_FILE.exists():
-        print(f"[error] 未找到 {URLS_FILE}。请在该文件中每行写一个 issue URL。")
-        sys.exit(2)
-    urls = []
-    for ln in URLS_FILE.read_text(encoding="utf-8").splitlines():
-        s = ln.strip()
-        if not s or s.startswith("#"):
-            continue
-        urls.append(s)
-    if not urls:
-        print(f"[error] {URLS_FILE} 中没有有效 URL。")
-        sys.exit(2)
-    return urls
+    return _common_load_urls(URLS_FILE)
 
 
 def process_issue(page, issue_url: str, use_cache: bool = True,
@@ -656,7 +644,7 @@ def process_issue(page, issue_url: str, use_cache: bool = True,
 
 def default_out_path() -> str:
     """默认输出文件名按日期：cell_YYYY-MM-DD.xlsx"""
-    return f"cell_{date.today().isoformat()}.xlsx"
+    return _common_default_out("cell")
 
 
 def run_scraper(urls: list[str], out_path: str | Path,
@@ -710,11 +698,7 @@ def run_scraper(urls: list[str], out_path: str | Path,
         ctx.close()
 
     # 统计实际拿到的（非 BLOCKED/FAILED）文章数；为 0 视为异常
-    real_count = sum(
-        1 for _, results in all_issues
-        for _, _, f in results
-        if f.get("title") and f["title"] not in ("[CF BLOCKED]", "[GOTO FAILED]")
-    )
+    real_count = count_real_articles(all_issues)
     if real_count == 0:
         cb.log(f"\n[warn] 全部完成但 0 篇成功（可能 CF/cookie 墙未过或结构变化）")
         cb.on_state({"phase": "all_skipped", "out_path": out_path,

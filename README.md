@@ -57,6 +57,8 @@ python science_scraper.py    # Science → science_YYYY-MM-DD.xlsx
 
 通用参数：`--out PATH` / `--fresh`（忽略缓存重抓）/ `--headless`（不推荐，过 CF 需可见）
 
+> Cell/Nature/Science 各自的 `web.py` / `nature_web.py` / `science_web.py` 已合并到 `unified_web.py`，单独的 web 入口已删除。
+
 URL 输入文件：
 | Source | 文件 | URL 模式 |
 |---|---|---|
