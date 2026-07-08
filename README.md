@@ -18,22 +18,44 @@
 
 ## 迁移到新设备
 
-```bash
+### Windows（PowerShell，推荐）
+
+```powershell
 git clone https://github.com/wangxz01/cnsfindchina.git
 cd cnsfindchina
 
-# 1. 装 uv（Mac/Linux）
-curl -LsSf https://astral.sh/uv/install.sh | sh
-# Windows（PowerShell）：
-#   irm https://astral.sh/uv/install.ps1 | iex
+# 1. 装 uv（首次迁移；已装过可跳过）
+irm https://astral.sh/uv/install.ps1 | iex
+# 如果上面报"无法加载文件...因为在此系统上禁止运行脚本"：
+#   powershell -ExecutionPolicy Bypass -Command "irm https://astral.sh/uv/install.ps1 | iex"
 
-uv sync                              # 装 Python + 依赖（按 uv.lock 锁定版本）
-uv run playwright install chromium   # 下载 Chromium
-uv run python src/unified_web.py     # 启动
+# 2. 装依赖（uv 自动下载 Python 3.12 + 所有库到 .venv，按 uv.lock 锁版本）
+uv sync
+
+# 3. 装 Chromium（一次性，约 280MB）
+uv run playwright install chromium
+
+# 4. 启动
+uv run python src/unified_web.py
 # 浏览器打开 http://127.0.0.1:8000/
 ```
 
-uv 会按 `uv.lock` 装完全一致的依赖版本，按 `.python-version` 装 Python 3.12——新设备无需预装 Python 或 pip。
+> 用 PowerShell 不要 cmd——cmd 默认 cp936 显示中文日志有坑（项目代码已强制 stdout 用 utf-8，但 cmd 显示层仍可能有问题）。装完后**新开一个 PowerShell 窗口**让 uv 进 PATH 生效。
+
+### macOS / Linux
+
+```bash
+git clone https://github.com/wangxz01/cnsfindchina.git
+cd cnsfindchina
+curl -LsSf https://astral.sh/uv/install.sh | sh
+uv sync
+uv run playwright install chromium
+uv run python src/unified_web.py
+```
+
+---
+
+新设备无需预装 Python 或 pip——uv 会按 `uv.lock` 装完全一致的依赖版本，按 `.python-version` 自动下载匹配的 Python。
 
 目录布局：
 ```
@@ -106,12 +128,19 @@ URL 输入文件（在 `data/` 下）：
 
 ```bash
 # 全部重抓
+# Mac/Linux:
 rm -rf data/cache data/cache_nature data/cache_science
+# Windows PowerShell:
+#   Remove-Item -Recurse -Force data\cache, data\cache_nature, data\cache_science
+
 # 或加 --fresh
 uv run python src/scraper.py --fresh
 
 # 只重抓某篇
+# Mac/Linux:
 rm data/cache/S0092867426003946.json
+# Windows PowerShell:
+#   Remove-Item data\cache\S0092867426003946.json
 ```
 
 修改了 scraper 的字段提取逻辑后，旧缓存不会自动失效——请手动清缓存或加 `--fresh`。

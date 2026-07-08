@@ -25,6 +25,16 @@ if TYPE_CHECKING:
     from scraper import ScraperCallbacks
 
 
+# 强制 stdout/stderr 用 utf-8，避免 Windows 默认 cp932/cp936 终端
+# print 中文日志时抛 UnicodeEncodeError 或乱码。Python 3.7+ 支持 reconfigure。
+# 放在 scraper_common 而非各 scraper，因为所有模块都 import 它，一处覆盖全部。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8")
+    except (AttributeError, OSError):
+        pass
+
+
 # ---------- 项目目录布局 ----------
 # 项目根 = 本文件所在目录的上一级（src/ 的父目录）
 PROJECT_ROOT = Path(__file__).parent.parent
