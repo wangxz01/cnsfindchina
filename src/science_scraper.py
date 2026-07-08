@@ -377,18 +377,7 @@ def process_issue(page, issue_url: str, use_cache: bool = True,
             rwait(15.0, 25.0)
             continue
 
-        if not wait_until_cf_clear(page, target_url=url, cb=cb):
-            cb.log(f"        [error] CF 未通过，本篇记为 [CF BLOCKED]")
-            fields = {
-                "url": url, "title": "[CF BLOCKED]", "doi": doi, "type": section,
-                "first_author": "", "first_aff": "", "first_author_country": "",
-                "is_china": False, "authors": [],
-            }
-            results.append((section, url, fields))
-            cb.on_state({"phase": "article_done", "url": url,
-                         "fields": fields, "blocked": True})
-            rwait(10.0, 18.0)
-            continue
+        # 文章页 CF 检测交给 extract_with_cf_retry 兜底（基于提取结果判定，更精准）
 
         # 等渲染
         try:

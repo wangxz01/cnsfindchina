@@ -79,10 +79,21 @@ class ScraperCallbacks:
         print(msg)
 
     def cf_wait(self, target_url: str, current_url: str,
-                attempt: int, max_attempts: int) -> bool:
-        """CF 触发时阻塞等待用户处理。返回 True 表示用户已处理；False 表示中止。"""
+                attempt: int, max_attempts: int,
+                check_clear=None) -> str:
+        """CF 触发时阻塞等待用户处理。
+
+        返回：
+          'user_resumed' —— 用户确认已处理
+          'auto_cleared' —— 页面已自动消退（CF 自消，无需用户操作）
+          'skip'         —— 用户跳过此文章（记为 BLOCKED 继续下一篇）
+          'cancelled'    —— 用户中止整个任务
+
+        check_clear：可选回调，调用方应在轮询中调用，返回 True 表示页面已恢复。
+        CLI 实现可忽略（终端 input 等用户）；Web 实现用于自动消退检测。
+        """
         input(f">>> 完成后回到此终端按 Enter（第 {attempt}/{max_attempts} 次）: ")
-        return True
+        return "user_resumed"
 
     def is_cancelled(self) -> bool:
         """是否被外部取消（如 Web 端按了停止）。"""
@@ -279,6 +290,7 @@ def wait_until_cf_clear(page, target_url: str | None = None,
         cb.log("  1) 完成人机验证（勾选复选框或等自动放行）")
         cb.log("  2) 必要时手动把地址栏改成目标 URL 并回车")
         cb.log("  3) 确认浏览器停在目标文章页（非 CF 挑战页）")
+        cb.log("  （挑战页常会自动消退，无需操作——程序会每 0.3s 检测一次）")
         cb.on_state({
             "phase": "cf_blocked",
             "target": target_url or "",
@@ -286,12 +298,23 @@ def wait_until_cf_clear(page, target_url: str | None = None,
             "attempt": attempt,
             "max_attempts": max_attempts,
         })
-        if not cb.cf_wait(target_url or "", cur, attempt, max_attempts):
-            return False
-        if cb.is_cancelled():
-            return False
 
-        # 给页面一点时间稳定
+        def _check_clear():
+            try:
+                return not is_cloudflare(page)
+            except Exception:
+                return False
+
+        result = cb.cf_wait(target_url or "", cur, attempt, max_attempts, _check_clear)
+        if result == "cancelled":
+            return False
+        if result == "skip":
+            return False  # 调用方据此记为 [CF BLOCKED]，继续下一篇
+        if result == "auto_cleared":
+            cb.log("[Cloudflare] 检测到挑战页已自动消退，继续。")
+            return True  # check_clear 已确认页面正常，跳过重复检测
+
+        # result == "user_resumed"：给页面稳定时间 + 再检测
         time.sleep(1.5)
         try:
             page.wait_for_load_state("domcontentloaded", timeout=15000)
@@ -640,19 +663,8 @@ def process_issue(page, issue_url: str, use_cache: bool = True,
             rwait(5.0, 10.0)
             continue
 
-        # CF 检测 + 用户手动处理
-        if not wait_until_cf_clear(page, target_url=url, cb=cb):
-            cb.log(f"        [error] CF 未通过，本篇记为 [CF BLOCKED]（不写缓存，下次重试）")
-            fields = {
-                "url": url, "title": "[CF BLOCKED]", "doi": pii, "type": section,
-                "first_author": "", "first_aff": "", "first_author_country": "",
-                "is_china": False, "authors": [],
-            }
-            results.append((section, url, fields))
-            cb.on_state({"phase": "article_done", "url": url,
-                         "fields": fields, "blocked": True})
-            rwait(5.0, 10.0)
-            continue
+        # 文章页 CF 检测交给 extract_with_cf_retry 兜底（基于提取结果判定，更精准）；
+        # 这里直接进 SPA 渲染等待 + 提取流程
 
         # 等待 SPA 渲染
         try:

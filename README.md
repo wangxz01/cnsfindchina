@@ -147,17 +147,30 @@ rm data/cache/S0092867426003946.json
 
 ## Cloudflare / Cookie 同意墙流程
 
-首次访问 Cell 几乎一定触发 Cloudflare；Nature/Science 有 Cookie 同意横幅。程序检测到拦截页时：
+首次访问 Cell 几乎一定触发 Cloudflare；Nature/Science 有 Cookie 同意横幅。**程序采用"先提取后判定"策略**——尽量不打扰用户：
 
-1. 网页顶部出现醒目黄色提示，含目标 URL 和当前 URL
-2. 你切到 Playwright 浏览器窗口：
+### 两层检测
+
+1. **issue 列表页**：goto 后必检测。若被墙，弹提示等用户处理（必须先拿到列表才能继续）。
+2. **文章页**：goto 后**直接提取**，不主动判定 CF。只有 `extract_fields` 拿到的 title 是 `"Are you a robot?"` / `"Just a moment..."` 等（说明确实撞到挑战页），才进入用户处理流程。
+
+> 之所以不主动判定：`is_cloudflare` 偶尔误报（Cookie banner 残留 / 页脚 CF marker 字符串），导致明明页面正常也强行让用户介入。基于提取结果判定更精准。
+
+### 触发后的三种处理方式
+
+网页顶部出现醒目黄色提示（含目标 URL 和当前 URL）时，可以：
+
+1. **什么都不做，等自动消退** ⭐——程序每 0.3s 检测一次页面，CF 挑战页通常几十秒内自动消退，自动继续抓取。
+2. **切到 Playwright 浏览器手动处理**：
    - Cloudflare：勾选复选框或等自动放行
    - Cookie 墙：点 "Accept All" / "Manage Preferences" 关闭横幅
    - 必要时手动把地址栏改回目标 URL 并回车
-3. 确认浏览器停在目标文章页（不是挑战页）
-4. 回网页点 **✓ 我已通过 Cloudflare 验证**，程序重新扫描判断
+   - 处理完回网页点 **✓ 我已通过验证**
+3. **点 ⏭ 跳过此文章**——把当前文章记为 `[CF BLOCKED]` 继续下一篇（不停整个任务）
 
-最多提示 3 次；3 次未过则该篇记为 `[CF BLOCKED]` 继续下一篇。
+### 重试上限
+
+每篇文章最多重试 5 次；5 次后仍是挑战页则记 `[CF BLOCKED]` 继续。被记 BLOCKED 的文章**不写缓存**，下次重跑会重试。
 
 `browser_profile*/` 持久化 Cookie，通过后的 `cf_clearance` 通常会被记住，同域名后续访问可能免挑战。
 

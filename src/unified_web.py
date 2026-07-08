@@ -120,6 +120,7 @@ class Session:
         self.thread: threading.Thread | None = None
         self.stop_event = threading.Event()
         self.cf_event = threading.Event()
+        self.cf_skip_event = threading.Event()
 
         self.status: str = "idle"
         self.current_issue: str = ""
@@ -179,18 +180,33 @@ class WebCallbacks(ScraperCallbacks):
         bus.broadcast({"type": "log", "source": self.source_key, "data": msg})
 
     def cf_wait(self, target_url: str, current_url: str,
-                attempt: int, max_attempts: int) -> bool:
+                attempt: int, max_attempts: int,
+                check_clear=None) -> str:
         self.session.set_status(
             "cf_blocked",
             cf_info={"target": target_url, "current": current_url,
                      "attempt": attempt, "max_attempts": max_attempts},
         )
         self.session.cf_event.clear()
-        # 0.3s 轮询 stop_event，让"停止"按钮尽快生效（之前是 2s）
-        while not self.session.cf_event.wait(timeout=0.3):
+        self.session.cf_skip_event.clear()
+        while True:
+            # 自动消退检测：每 0.3s 调一次，CF 自己消退就放行（无需用户操作）
+            if check_clear is not None:
+                try:
+                    if check_clear():
+                        self.session.set_status("running")
+                        return "auto_cleared"
+                except Exception:
+                    pass
+            # 用户按"✓ 我已通过验证"
+            if self.session.cf_event.wait(timeout=0.3):
+                return "user_resumed"
+            # 用户按"⏭ 跳过此文章"
+            if self.session.cf_skip_event.is_set():
+                return "skip"
+            # 用户按"停止"（整个任务）
             if self.session.stop_event.is_set():
-                return False
-        return not self.session.stop_event.is_set()
+                return "cancelled"
 
     def is_cancelled(self) -> bool:
         return self.session.stop_event.is_set()
@@ -375,6 +391,14 @@ def cf_resumed(source: str = Query(...)):
     """前端按 source 触发：只唤醒对应 session 的 CF 等待。"""
     _resolve_source(source)
     SESSIONS[source].cf_event.set()
+    return {"ok": True}
+
+
+@app.post("/api/cf_skip")
+def cf_skip(source: str = Query(...)):
+    """跳过当前文章：让 CF 等待立即返回 'skip'，文章记 [CF BLOCKED] 继续下一篇。"""
+    _resolve_source(source)
+    SESSIONS[source].cf_skip_event.set()
     return {"ok": True}
 
 

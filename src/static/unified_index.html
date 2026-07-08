@@ -183,7 +183,7 @@
   <div class="cf-banner" v-if="state.status === 'cf_blocked'">
     <h3>⚠️ 浏览器触发了 Cloudflare 验证（第 {{ state.cf_info.attempt }}/{{ state.cf_info.max_attempts }} 次）</h3>
     <p style="margin: 4px 0 8px; font-size: 13px;">
-      请切到弹出的浏览器窗口完成验证，确认停在目标文章页（不是 CF 挑战页），然后回来点下方按钮。
+      挑战页常会自动消退——程序每 0.3s 检测一次，无需操作。也可在浏览器里手动通过验证，或点"跳过此文章"放弃本篇继续下一篇。
     </p>
     <p style="margin: 4px 0; font-size: 12px;">
       <b>目标 URL：</b><code>{{ state.cf_info.target || '(未知)' }}</code>
@@ -191,7 +191,10 @@
     <p style="margin: 4px 0 12px; font-size: 12px;">
       <b>当前 URL：</b><code>{{ state.cf_info.current || '(未知)' }}</code>
     </p>
-    <button class="btn-warning" @click="resumeCf">✓ 我已通过 Cloudflare 验证</button>
+    <div class="btn-row">
+      <button class="btn-warning" @click="resumeCf">✓ 我已通过验证</button>
+      <button class="btn-ghost" @click="skipCf">⏭ 跳过此文章（记为 BLOCKED 继续）</button>
+    </div>
   </div>
 
   <div class="grid">
@@ -402,6 +405,11 @@ createApp({
       await fetch(`/api/cf_resumed?source=${src}`, {method: 'POST'});
       pushLog(src, '[ui] 已通知后端继续');
     }
+    async function skipCf() {
+      const src = currentSource.value;
+      await fetch(`/api/cf_skip?source=${src}`, {method: 'POST'});
+      pushLog(src, '[ui] 已跳过此文章，记为 BLOCKED');
+    }
     async function resetCache() {
       const src = currentSource.value;
       if (!confirm(`确认清空 ${src} 的缓存？下次会全部重抓。`)) return;
@@ -491,7 +499,7 @@ createApp({
       state, states, urlsText, logLines, articles, logEl,
       sources, currentSource, runningSources, cfBlockedSources,
       busy, statusLabel, progressPercent, lineClass, chinaCount,
-      loadUrls, saveUrls, start, stop, stopAll, resumeCf, resetCache, download, exportNow,
+      loadUrls, saveUrls, start, stop, stopAll, resumeCf, skipCf, resetCache, download, exportNow,
       switchSource,
     };
   }
