@@ -21,13 +21,19 @@
 ```bash
 git clone https://github.com/wangxz01/cnsfindchina.git
 cd cnsfindchina
-pip install -r requirements.txt
-playwright install chromium
-python src/unified_web.py
+
+# 1. 装 uv（Mac/Linux）
+curl -LsSf https://astral.sh/uv/install.sh | sh
+# Windows（PowerShell）：
+#   irm https://astral.sh/uv/install.ps1 | iex
+
+uv sync                              # 装 Python + 依赖（按 uv.lock 锁定版本）
+uv run playwright install chromium   # 下载 Chromium
+uv run python src/unified_web.py     # 启动
 # 浏览器打开 http://127.0.0.1:8000/
 ```
 
-前提：已装 **Python 3.10+**（Windows 安装时勾选 "Add to PATH"）。
+uv 会按 `uv.lock` 装完全一致的依赖版本，按 `.python-version` 装 Python 3.12——新设备无需预装 Python 或 pip。
 
 目录布局：
 ```
@@ -72,9 +78,9 @@ python src/unified_web.py --port 8080
 三个独立 CLI（不依赖 Web 服务）：
 
 ```bash
-python src/scraper.py            # Cell    → data/cell_YYYY-MM-DD.xlsx
-python src/nature_scraper.py     # Nature  → data/nature_YYYY-MM-DD.xlsx
-python src/science_scraper.py    # Science → data/science_YYYY-MM-DD.xlsx
+uv run python src/scraper.py            # Cell    → data/cell_YYYY-MM-DD.xlsx
+uv run python src/nature_scraper.py     # Nature  → data/nature_YYYY-MM-DD.xlsx
+uv run python src/science_scraper.py    # Science → data/science_YYYY-MM-DD.xlsx
 ```
 
 通用参数：`--out PATH` / `--fresh`（忽略缓存重抓）/ `--headless`（不推荐，过 CF 需可见）
@@ -102,7 +108,7 @@ URL 输入文件（在 `data/` 下）：
 # 全部重抓
 rm -rf data/cache data/cache_nature data/cache_science
 # 或加 --fresh
-python src/scraper.py --fresh
+uv run python src/scraper.py --fresh
 
 # 只重抓某篇
 rm data/cache/S0092867426003946.json
@@ -161,7 +167,7 @@ rm data/cache/S0092867426003946.json
 | `src/scraper_common.py` | 共用工具（缓存、URL 加载、DATA_DIR、safe_goto） |
 | `src/excel_writer.py` | Excel 输出（多 sheet + 自定义列 schema） |
 | `data/urls.txt` / `data/urls_nature.txt` / `data/urls_science.txt` | 各 source 的 issue URL 列表 |
-| `requirements.txt` | 依赖 |
+| `pyproject.toml` / `uv.lock` / `.python-version` | uv 依赖与 Python 版本管理 |
 | `data/browser_profile*/` | Playwright 持久化浏览器配置（运行后生成，不入库） |
 | `data/cache*/` | 按 PII/DOI 的文章缓存（运行后生成，不入库） |
 

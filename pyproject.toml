@@ -1,0 +1,14 @@
+[project]
+name = "cnsfindchina"
+version = "0.1.0"
+description = "CNS (Cell/Nature/Science) issue scraper — count China-first-author papers"
+requires-python = ">=3.10"
+dependencies = [
+    "playwright>=1.40",
+    "openpyxl>=3.1",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+]
+
+[tool.uv]
+package = false
