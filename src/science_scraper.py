@@ -36,6 +36,7 @@ from scraper import (
     ScraperCallbacks,
     rwait, human_pause, human_scroll, random_mouse_jitter,
     is_cloudflare, wait_until_cf_clear,
+    extract_with_cf_retry,
 )
 from nature_scraper import parse_country, is_china_country  # 国别判定逻辑完全一致
 from excel_writer import write_excel, NATURE_COLUMNS  # 列定义相同
@@ -397,17 +398,15 @@ def process_issue(page, issue_url: str, use_cache: bool = True,
         human_pause(page, 1.5, 3.0)
         human_scroll(page)
 
-        fields = extract_fields(page, url)
-        if section:
-            fields["type"] = section
-        if not fields["title"] or "are you a robot" in fields["title"].lower() \
-           or "just a moment" in fields["title"].lower():
-            cb.log("        [warn] 解析失败（疑似 CF 页），再次进入手动处理")
-            if wait_until_cf_clear(page, target_url=url, cb=cb):
-                human_pause(page, 1.5, 3.0)
-                fields = extract_fields(page, url)
-                if section:
-                    fields["type"] = section
+        fields = extract_with_cf_retry(page, url, cb, section,
+                                       extract_fields, human_pause, max_retries=5)
+        if fields is None:
+            cb.log("        [error] 多次重试仍是挑战页，记为 [CF BLOCKED]")
+            fields = {
+                "url": url, "title": "[CF BLOCKED]", "doi": doi, "type": section,
+                "first_author": "", "first_aff": "", "first_author_country": "",
+                "is_china": False, "authors": [],
+            }
         results.append((section, url, fields))
 
         cb.log(f"        标题: {fields['title'][:80]}")

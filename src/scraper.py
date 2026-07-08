@@ -250,16 +250,20 @@ def is_cloudflare(page) -> bool:
 
 
 def wait_until_cf_clear(page, target_url: str | None = None,
-                        max_attempts: int = 3, cb: ScraperCallbacks | None = None) -> bool:
+                        max_attempts: int = 3, cb: ScraperCallbacks | None = None,
+                        force: bool = False) -> bool:
     """检测并处理 CF；最多提示用户 max_attempts 次。返回是否已通过。
 
     设计要点：
     - 不自动 reload/goto（用户反馈自动重导航会再次触发 CF 造成循环）
     - 只检测 + 提示 + 等用户手动操作 + 再检测
     - 用户应在浏览器中手动让页面停在目标 URL 上
+    - force=True：跳过 is_cloudflare 首检，强制进入"提示 + cf_wait"流程
+      —— 用于 title 异常但 is_cloudflare 未识别的挑战页（如 Elsevier 的
+      "Are you a robot?"：标记在 citation_title meta 里，<title> 不命中）。
     """
     cb = cb or ScraperCallbacks()
-    if not is_cloudflare(page):
+    if not force and not is_cloudflare(page):
         return True
 
     for attempt in range(1, max_attempts + 1):
@@ -300,6 +304,50 @@ def wait_until_cf_clear(page, target_url: str | None = None,
 
     cb.log("[Cloudflare] 多次尝试后仍未通过。")
     return False
+
+
+# ---------- 提取 + 挑战页兜底（Cell/Nature/Science 共用） ----------
+
+
+def _is_challenge_title(title: str) -> bool:
+    """标题是否疑似 CF / 机器人挑战页（强制重提取的依据）。
+
+    空 title 视为异常（强制让用户介入），避免把空标题静默写入缓存。
+    """
+    if not title:
+        return True
+    low = title.lower()
+    return any(m in low for m in ("are you a robot", "just a moment", "attention required"))
+
+
+def extract_with_cf_retry(page, url: str, cb, section: str, extract_fn,
+                          human_pause_fn, max_retries: int = 5) -> dict | None:
+    """提取 → 若疑似挑战页 → 强制等用户介入 → 重提取，循环至正常或达上限。
+
+    返回正常 fields；用户取消或达到 max_retries 仍异常时返回 None
+    （调用方记为 [CF BLOCKED]，不写缓存）。
+
+    用于 Cell/Nature/Science 三个 scraper 的 process_issue：goto 通过 CF 检查后，
+    extract_fields 拿到的 title 仍可能是 "Are you a robot?" 等——is_cloudflare
+    未识别这种 Elsevier 挑战页，需要靠 title 兜底。
+    """
+    fields = extract_fn(page, url)
+    if section:
+        fields["type"] = section
+    for attempt in range(1, max_retries + 1):
+        if not _is_challenge_title(fields.get("title", "")):
+            return fields
+        cb.log(f"        [warn] 第 {attempt}/{max_retries} 次提取疑似挑战页 "
+               f"(title={fields.get('title')!r})，请手动处理后继续")
+        # force=True 跳过 is_cloudflare 首检；max_attempts=1 让本函数外层循环控制总次数
+        if not wait_until_cf_clear(page, target_url=url, cb=cb,
+                                   max_attempts=1, force=True):
+            return None
+        human_pause_fn(1.2, 2.8)
+        fields = extract_fn(page, url)
+        if section:
+            fields["type"] = section
+    return None
 
 
 # ---------- issue 列表抽取 ----------
@@ -621,19 +669,15 @@ def process_issue(page, issue_url: str, use_cache: bool = True,
             pass
         human_pause(page, 0.5, 1.5)
 
-        fields = extract_fields(page, url)
-        # 用 issue 页的 section 覆盖 type（与 Nature/Science 同口径）
-        if section:
-            fields["type"] = section
-        # 疑似 CF 残留页：再过一次并重新解析
-        if not fields["title"] or "are you a robot" in fields["title"].lower() \
-           or "just a moment" in fields["title"].lower():
-            cb.log("        [warn] 解析失败（疑似 CF 页），再次进入手动处理")
-            if wait_until_cf_clear(page, target_url=url, cb=cb):
-                human_pause(page, 1.2, 2.8)
-                fields = extract_fields(page, url)
-                if section:
-                    fields["type"] = section
+        fields = extract_with_cf_retry(page, url, cb, section,
+                                       extract_fields, human_pause, max_retries=5)
+        if fields is None:
+            cb.log("        [error] 多次重试仍是挑战页，记为 [CF BLOCKED]")
+            fields = {
+                "url": url, "title": "[CF BLOCKED]", "doi": pii, "type": section,
+                "first_author": "", "first_aff": "", "first_author_country": "",
+                "is_china": False, "authors": [],
+            }
         results.append((section, url, fields))
 
         cb.log(f"        标题(art): {fields['title'][:80]}")
