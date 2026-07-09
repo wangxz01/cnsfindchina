@@ -7,7 +7,7 @@
 流程:
     1. Playwright 持久化浏览器逐个打开 issue URL
     2. Cookie 同意墙 / 反爬触发时暂停等用户手动处理（复用 Cell 的 CF 检测）
-    3. 抽取 Research Articles（专业论文，按 h5.to-section 分组）
+    3. 抽取所有分类的文章（按 h5.to-section 分组，不过滤 section）
     4. 逐篇打开文章页，提取：
        标题 / DOI / 类型 / 一作 / 一作单位 (#con1_content 内首个 affiliation) /
        一作国家 / 是否中国 / 作者列表
@@ -52,19 +52,10 @@ from scraper_common import (
 )
 
 BASE = "https://www.science.org"
-# 只处理 Research Articles（专业论文）；Perspectives 是评论性短文，不算专业论文
-# 用小写 substring 匹配，避免期刊改名（如 "Research Article" 单数）导致 0 篇
-WANTED_SECTIONS = {"research article"}
 
 PROFILE_DIR = DATA_DIR / "browser_profile_science"
 URLS_FILE = DATA_DIR / "urls_science.txt"
 CACHE_DIR = DATA_DIR / "cache_science"
-
-
-def _section_wanted(section: str) -> bool:
-    """大小写/单复数不敏感的 substring 匹配。"""
-    s = (section or "").lower()
-    return any(w in s for w in WANTED_SECTIONS)
 
 
 # ---------- issue 列表抽取 ----------
@@ -124,6 +115,17 @@ def extract_article_list(page) -> list[tuple[str, str, str]]:
         seen.add(doi)
         cleaned.append((item.get("section", "").strip(), url, item.get("title", "").strip()))
     return cleaned
+
+
+def count_expected(page) -> int:
+    """独立计数：regex 扫描 page.content() 原始 HTML 中的所有 science DOI，去重后返回。
+
+    与 extract_article_list 的 DOM 选择器路径独立。
+    只匹配 /doi/ URL 路径里的 DOI，避免 issue DOI (10.1126/science.2026.392.issue-XXXX) 干扰。
+    """
+    html = page.content()
+    ids = set(re.findall(r'/doi/(?:abs/|full/|pdf/|epdf/)?(10\.1126/science\.[a-z0-9]+)', html))
+    return len(ids)
 
 
 # ---------- 文章字段抽取 ----------
@@ -320,20 +322,20 @@ def process_issue(page, issue_url: str, use_cache: bool = True,
         cb.log("[error] 0 篇文章，请检查上方 DOM 状态（可能是 cookie 墙未过 / 反爬 / 结构变化）")
         return []
 
-    targets = [t for t in all_articles if _section_wanted(t[0])]
-    cb.log(f"[*] 过滤到 {WANTED_SECTIONS}：{len(targets)} 篇")
+    targets = all_articles
+    # 数量检验：独立 regex 计数 vs DOM 提取计数（避免循环论证）
+    expected = count_expected(page)
+    cb.on_state({"phase": "count_check", "issue_url": issue_url,
+                 "expected": expected, "actual": len(targets)})
+    if expected != len(targets):
+        cb.log(f"[warn] 数量检验不一致：DOM 提取 {len(targets)} 篇 vs 页面 regex {expected} 篇")
+    else:
+        cb.log(f"[check] 数量检验通过：{len(targets)} 篇 == 页面 {expected} 篇")
+    cb.log(f"[*] 共 {len(targets)} 篇文章（全部 section，不过滤）")
     for sec, url, ttl in targets:
         cb.log(f"      - [{sec}] {ttl[:60]}")
     cb.on_state({"phase": "issue_plan", "issue_url": issue_url,
                  "targets": [(s, u, t) for s, u, t in targets]})
-
-    if not targets:
-        # 也 dump 一下实际看到的 section 名
-        from collections import Counter
-        sec_counts = Counter(t[0] for t in all_articles).most_common()
-        cb.log(f"[diag] 实际 section 分布: {dict(sec_counts)}")
-        cb.log(f"[error] WANTED={WANTED_SECTIONS} 不匹配任何 section，请检查实际名称")
-        return []
 
     results = []
     total = len(targets)

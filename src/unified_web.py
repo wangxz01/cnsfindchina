@@ -232,6 +232,16 @@ class WebCallbacks(ScraperCallbacks):
                 article_total=state.get("article_total", 0),
                 current_issue=state.get("issue_url", self.session.current_issue),
             )
+        elif phase == "count_check":
+            bus.broadcast({
+                "type": "count_check",
+                "source": self.source_key,
+                "data": {
+                    "issue_url": state.get("issue_url", ""),
+                    "expected": state.get("expected", 0),
+                    "actual": state.get("actual", 0),
+                },
+            })
         elif phase == "article_done":
             f = state.get("fields", {})
             bus.broadcast({

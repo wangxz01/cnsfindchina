@@ -1,5 +1,5 @@
 # 每行一个 Science issue URL，# 开头为注释。程序会按顺序逐个抓取。
-# 只处理 Research Articles（专业论文）。
+# 抓取所有 section 的文章。
 # URL 模式：https://www.science.org/toc/science/<vol>/<issue>
 https://www.science.org/toc/science/392/6804
 # 更多示例：

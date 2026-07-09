@@ -222,6 +222,10 @@
         <div class="meta-row" style="margin-bottom: 8px;">
           <span>Issue：<b>{{ state.issue_idx }}/{{ state.issue_total }}</b></span>
           <span>文章：<b>{{ state.article_idx }}/{{ state.article_total }}</b></span>
+          <span v-if="countCheck">数量检验：
+            <b v-if="countCheck.actual === countCheck.expected" style="color: #1a7a3e;">✓ {{ countCheck.actual }}/{{ countCheck.expected }}</b>
+            <b v-else style="color: #a02020;">⚠ DOM {{ countCheck.actual }} vs 页面 {{ countCheck.expected }}</b>
+          </span>
         </div>
         <div style="font-size: 13px; color: #6e6e73; margin-bottom: 12px; min-height: 20px;">
           <span v-if="state.current_article_url">
@@ -313,6 +317,7 @@ createApp({
     const urlsBySource = reactive({cell: '', nature: '', science: ''});
     const logsBySource = reactive({cell: [], nature: [], science: []});
     const articlesBySource = reactive({cell: [], nature: [], science: []});
+    const countChecksBySource = reactive({cell: null, nature: null, science: null});
 
     const logEl = ref(null);
     const currentSource = ref('cell');
@@ -330,6 +335,7 @@ createApp({
     });
     const logLines = computed(() => logsBySource[currentSource.value]);
     const articles = computed(() => articlesBySource[currentSource.value]);
+    const countCheck = computed(() => countChecksBySource[currentSource.value]);
 
     const busy = computed(() => state.value.status === 'running' || state.value.status === 'cf_blocked');
     const statusLabel = computed(() => ({
@@ -380,6 +386,7 @@ createApp({
       const src = currentSource.value;
       articlesBySource[src] = [];
       logsBySource[src] = [];
+      countChecksBySource[src] = null;
       await saveUrls();
       const r = await fetch(`/api/start?source=${src}`, {
         method: 'POST',
@@ -478,6 +485,8 @@ createApp({
           Object.assign(states[src], d.data);
         } else if (d.type === 'article_done') {
           articlesBySource[src].push(d.data);
+        } else if (d.type === 'count_check') {
+          countChecksBySource[src] = d.data;
         }
       };
       es.onerror = () => { /* 浏览器自动重连 */ };
@@ -496,7 +505,7 @@ createApp({
     });
 
     return {
-      state, states, urlsText, logLines, articles, logEl,
+      state, states, urlsText, logLines, articles, countCheck, logEl,
       sources, currentSource, runningSources, cfBlockedSources,
       busy, statusLabel, progressPercent, lineClass, chinaCount,
       loadUrls, saveUrls, start, stop, stopAll, resumeCf, skipCf, resetCache, download, exportNow,

@@ -7,7 +7,7 @@
 流程:
     1. Playwright 持久化浏览器逐个打开 issue URL
     2. Cookie 同意墙 / 反爬触发时暂停等用户手动处理（复用 Cell 的 CF 检测）
-    3. 抽取 Articles + Perspective（s41586- 前缀的研究论文）
+    3. 抽取所有分类的 s41586- 研究论文（不过滤 section）
     4. 逐篇打开文章页，提取：
        标题 / DOI / 类型 / 一作 / 一作单位 (Aff1) / 一作国家 / 是否中国 / 作者列表
     5. 每个 issue 一个 sheet 写入 Excel（列定义见 excel_writer.NATURE_COLUMNS）
@@ -54,22 +54,10 @@ from scraper_common import (
 
 BASE = "https://www.nature.com"
 
-# 只处理这两个 section（都是 s41586- 研究论文）
-# 用小写 substring 匹配，避免单复数/大小写差异导致 0 篇
-WANTED_SECTIONS = {"article", "perspective"}
-
 # Cell 与 Nature 用不同 profile / cache，避免 cookie 互染
 PROFILE_DIR = DATA_DIR / "browser_profile_nature"
 URLS_FILE = DATA_DIR / "urls_nature.txt"
 CACHE_DIR = DATA_DIR / "cache_nature"
-
-
-def _section_wanted(section: str) -> bool:
-    """大小写不敏感的 substring 匹配，兼容单复数与多余修饰词。"""
-    s = (section or "").lower()
-    # 注意 "article" 会匹配到 "research article" / "article correction" 等；
-    # 我们已在上游把 Author/Publisher Correction 过滤掉，所以这里安全
-    return any(w in s for w in WANTED_SECTIONS)
 
 
 # ---------- 国别识别 ----------
@@ -232,6 +220,16 @@ def extract_article_list(page) -> list[tuple[str, str, str]]:
             continue
         cleaned.append((section, url, title))
     return cleaned
+
+
+def count_expected(page) -> int:
+    """独立计数：regex 扫描 page.content() 原始 HTML 中的所有 s41586- 文章 ID，去重后返回。
+
+    与 extract_article_list 的 DOM 选择器路径独立。
+    """
+    html = page.content()
+    ids = set(re.findall(r'/articles/(s41586-\d{3}-\d{4,7}-[a-z0-9]+)', html))
+    return len(ids)
 
 
 # ---------- 文章字段抽取 ----------
@@ -400,9 +398,16 @@ def process_issue(page, issue_url: str, use_cache: bool = True,
         return []
 
     all_articles = extract_article_list(page)
-    cb.log(f"[*] 共发现 {len(all_articles)} 篇 s41586 文章（Articles + Perspective）")
-    targets = [t for t in all_articles if _section_wanted(t[0])]
-    cb.log(f"[*] 过滤到 Articles/Perspective：{len(targets)} 篇")
+    targets = all_articles
+    # 数量检验：独立 regex 计数 vs DOM 提取计数（避免循环论证）
+    expected = count_expected(page)
+    cb.on_state({"phase": "count_check", "issue_url": issue_url,
+                 "expected": expected, "actual": len(targets)})
+    if expected != len(targets):
+        cb.log(f"[warn] 数量检验不一致：DOM 提取 {len(targets)} 篇 vs 页面 regex {expected} 篇")
+    else:
+        cb.log(f"[check] 数量检验通过：{len(targets)} 篇 == 页面 {expected} 篇")
+    cb.log(f"[*] 共 {len(targets)} 篇 s41586 文章（全部 section，不过滤）")
     for sec, url, ttl in targets:
         cb.log(f"      - [{sec}] {ttl[:60]}")
     cb.on_state({"phase": "issue_plan", "issue_url": issue_url,

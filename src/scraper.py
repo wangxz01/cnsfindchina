@@ -7,7 +7,7 @@
 流程:
     1. 用 Playwright 持久化浏览器逐个打开 urls.txt 里的 issue URL
     2. 检测 Cloudflare，若被挑战则提示用户手动过验证后回终端按 Enter
-    3. 抽取每个 issue 中 Articles / Short Articles / Resources 三个分类下的文章链接
+    3. 抽取每个 issue 中所有分类下的文章链接（不过滤 section）
     4. 逐篇打开文章页，从首次加载的 HTML 内嵌 JSON 提取
        标题/DOI/作者/首条 affiliation；若 affiliation 缺失，回退 JS 点击 #show-more-btn
     5. 每个 issue 一个 sheet 写入 Excel；多次运行从零开始，不做断点续爬
@@ -53,18 +53,9 @@ def _country_helpers():
 BASE = "https://www.sciencedirect.com"
 ISSUE_URL_EXAMPLE = "https://www.sciencedirect.com/journal/cell/vol/189/issue/10"
 
-# 只爬这三个 section（substring 匹配，兼容 Articles/Article 等变体）
-WANTED_SECTIONS = {"article", "short article", "resource"}
-
 PROFILE_DIR = DATA_DIR / "browser_profile"
 URLS_FILE = DATA_DIR / "urls.txt"
 CACHE_DIR = DATA_DIR / "cache"
-
-
-def _section_wanted(section: str) -> bool:
-    """大小写不敏感的 substring 匹配。"""
-    s = (section or "").lower()
-    return any(w in s for w in WANTED_SECTIONS)
 
 
 # ---------- Callbacks ----------
@@ -435,6 +426,17 @@ def extract_article_list(page) -> list[tuple[str, str, str]]:
     return cleaned
 
 
+def count_expected(page) -> int:
+    """独立计数：regex 扫描 page.content() 原始 HTML 中的所有 PII，去重后返回。
+
+    与 extract_article_list 的 DOM 选择器（querySelectorAll）路径独立——
+    直接扫描 HTML 字符串，能捕获 DOM 选择器遗漏的文章。
+    """
+    html = page.content()
+    piis = set(re.findall(r'/science/article/pii/(S\d{16})', html))
+    return len(piis)
+
+
 # ---------- 文章字段抽取 ----------
 
 
@@ -610,9 +612,16 @@ def process_issue(page, issue_url: str, use_cache: bool = True,
         return []
 
     all_articles = extract_article_list(page)
-    cb.log(f"[*] 共发现 {len(all_articles)} 篇文章（全部 section）")
-    targets = [t for t in all_articles if _section_wanted(t[0])]
-    cb.log(f"[*] 过滤到 Articles/Short Articles/Resources：{len(targets)} 篇")
+    targets = all_articles
+    # 数量检验：独立 regex 计数 vs DOM 提取计数（避免循环论证）
+    expected = count_expected(page)
+    cb.on_state({"phase": "count_check", "issue_url": issue_url,
+                 "expected": expected, "actual": len(targets)})
+    if expected != len(targets):
+        cb.log(f"[warn] 数量检验不一致：DOM 提取 {len(targets)} 篇 vs 页面 regex {expected} 篇")
+    else:
+        cb.log(f"[check] 数量检验通过：{len(targets)} 篇 == 页面 {expected} 篇")
+    cb.log(f"[*] 共 {len(targets)} 篇文章（全部 section，不过滤）")
     for sec, url, ttl in targets:
         cb.log(f"      - [{sec}] {ttl[:60]}")
     cb.on_state({"phase": "issue_plan", "issue_url": issue_url,

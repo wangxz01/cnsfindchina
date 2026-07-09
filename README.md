@@ -15,6 +15,8 @@
 - 反 IP 封禁：随机停顿、鼠标抖动、慢速滚动、长歇
 - 按文章 ID 缓存（断点续爬），缓存命中不访问网络
 - 国别识别：60+ 国家别名表，一作 Affiliation 末段匹配
+- **全 section 爬取**：不过滤 article/perspective/resource 等 section，抓 issue 里所有文章
+- **数量检验**：每个 issue 用独立 regex 计数交叉验证 DOM 提取数，避免循环论证
 
 ## 迁移到新设备
 
@@ -71,7 +73,8 @@ cnsfindchina/
 │   ├── cache{,_nature,_science}/             # 运行后生成
 │   └── *_*.xlsx                               # 输出
 ├── README.md
-└── requirements.txt
+├── pyproject.toml
+└── uv.lock
 ```
 
 迁移不带的（已在 `.gitignore`）：
@@ -145,6 +148,28 @@ rm data/cache/S0092867426003946.json
 
 修改了 scraper 的字段提取逻辑后，旧缓存不会自动失效——请手动清缓存或加 `--fresh`。
 
+## 数量检验
+
+每个 issue 加载完文章列表后，程序用**两种独立方法**计数并交叉验证，避免"用同一套选择器验证自己"的循环论证：
+
+| 方法 | 路径 | 用途 |
+|---|---|---|
+| DOM 提取 | `page.evaluate(JS)` → `document.querySelectorAll(selector)` → 遍历 DOM 树 | 实际爬取的文章列表 |
+| regex 独立计数 | `page.content()` → Python regex 扫描原始 HTML 字符串 | 交叉验证 |
+
+两条路径完全独立——如果 DOM 选择器漏抓文章（选择器写错、动态渲染未完成等），regex 仍能从原始 HTML 中发现它们，从而触发不一致告警。
+
+- **一致**：日志 `[check] 数量检验通过：N 篇 == 页面 N 篇`，Web 面板显示 `✓ N/N`
+- **不一致**：日志 `[warn] 数量检验不一致：DOM X 篇 vs 页面 Y 篇`，Web 面板显示 `⚠ DOM X vs 页面 Y`
+
+各 source 的 regex 模式：
+
+| Source | 模式 | 说明 |
+|---|---|---|
+| Cell | `/science/article/pii/S\d{16}` | PII 路径 |
+| Nature | `/articles/s41586-\d{3}-\d{4,7}-[a-z0-9]+` | 研究论文 DOI 前缀 |
+| Science | `/doi/10\.1126/science\.[a-z0-9]+` | 用 `/doi/` 前缀避开 meta 标签里的 issue DOI |
+
 ## Cloudflare / Cookie 同意墙流程
 
 首次访问 Cell 几乎一定触发 Cloudflare；Nature/Science 有 Cookie 同意横幅。**程序采用"先提取后判定"策略**——尽量不打扰用户：
@@ -183,7 +208,7 @@ rm data/cache/S0092867426003946.json
 | 行/列 | A | B | C | D | E | F | G | H | I |
 |---|---|---|---|---|---|---|---|---|---|
 | 1 | issue URL | | | | | | | | |
-| 2 | Articles / Research Articles / Perspective（分类名独占一行） | | | | | | | | |
+| 2 | section 分类名（独占一行，如 Articles / Research Articles 等） | | | | | | | | |
 | 3+ | 文章 URL | 标题 | DOI | 类型 | 一作 | 一作单位 | 一作国家 | 是否中国 | 作者列表 |
 
 ## 反 IP 封禁策略
