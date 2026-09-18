@@ -1,251 +1,146 @@
 # CNS 期刊爬虫
 
-统一的 Cell / Nature / Science 期刊 issue 爬虫：从一期 issue 的 URL 抓取**每篇论文的标题、DOI、作者、一作单位、一作国别、是否中国**，写入 Excel（每个 issue 一个 sheet）。
+抓取 Cell / Nature / Science 的 issue 目录、文章信息、作者单位及**文章发布日期**，输出 Excel，并统计署名第一作者的中国单位情况。
 
-主要用途：**统计一期 CNS 期刊里有多少篇论文的一作在中国机构**。
+## 日期与统计口径
 
-**支持的 issue URL 模式**（三个不一样，容易混）：
-- Cell：`https://www.sciencedirect.com/journal/cell/vol/<v>/issue/<i>`
-- Nature：`https://www.nature.com/nature/volumes/<v>/issues/<i>`
-- Science：`https://www.science.org/toc/science/<v>/<i>`
+| 来源 | Excel 日期列 | 取值规则 |
+|---|---|---|
+| Cell | `Available online`、`Version of Record` | 两个独立字段；读取页面明确标签或同名日期元数据；需要时点击 Show more，再打开文章历史入口 |
+| Nature | `发布日期` | 文章的 online / publication 元数据，或 Published 标记 |
+| Science | `发布日期` | 文章的 online / publication 元数据，或 Published 标记 |
 
-特性：
-- 统一 Web 控制台，**Cell / Nature / Science 三个 source 完全隔离，可同时并行运行**
-- Cloudflare / Cookie 同意墙人工放行（暂停 → 浏览器里过验证 → 网页继续）
-- 反 IP 封禁：随机停顿、鼠标抖动、慢速滚动、长歇
-- 按文章 ID 缓存（断点续爬），缓存命中不访问网络
-- 国别识别：60+ 国家别名表，一作 Affiliation 末段匹配
-- **全 section 爬取**：不过滤 article/perspective/resource 等 section，抓 issue 里所有文章
-- **数量检验**：每个 issue 用独立 regex 计数交叉验证 DOM 提取数，避免循环论证
+- 日期以真正的 Excel 日期单元格写入，显示 `yyyy-mm-dd`，可排序、筛选和计算。
+- Cell 的两个日期不互相代替，也不用 Received、Accepted、期刊期次日期或抓取当天日期补齐。
+- 缺失日期在 Excel 留空，在网页显示“待补全”；“待补字段”指出具体缺项，“日期来源”保存提取依据。
+- 统计对象是**署名第一作者**，不自动把共同一作纳入。检查其所有明确关联单位，任一国家为 China 则计“是”。
+- 作者与单位通过引用关系或单位作者名单对应；不会仅因单位排在第一条就当作一作单位。
+- “是否中国”有“是 / 否 / 待核实”三种状态。缺失单位、对应关系不明、国家无法识别，均不会计入“否”。
+- 国家名称沿用页面地址和别名表；当前 China 判定不自动合并单独标为 Hong Kong、Taiwan 等的地址。
 
-## 迁移到新设备
+## 安装与启动
 
-### Windows（PowerShell，推荐）
+Windows PowerShell：
 
 ```powershell
 git clone https://github.com/wangxz01/cnsfindchina.git
 cd cnsfindchina
-
-# 1. 装 uv（首次迁移；已装过可跳过）
+# 已安装 uv 可跳过
 irm https://astral.sh/uv/install.ps1 | iex
-# 如果上面报"无法加载文件...因为在此系统上禁止运行脚本"：
-#   powershell -ExecutionPolicy Bypass -Command "irm https://astral.sh/uv/install.ps1 | iex"
-
-# 2. 装依赖（uv 自动下载 Python 3.12 + 所有库到 .venv，按 uv.lock 锁版本）
-uv sync
-
-# 3. 装 Chromium（一次性，约 280MB）
+uv sync --locked
 uv run playwright install chromium
-
-# 4. 启动
 uv run python src/unified_web.py
-# 浏览器打开 http://127.0.0.1:8000/
 ```
 
-> 用 PowerShell 不要 cmd——cmd 默认 cp936 显示中文日志有坑（项目代码已强制 stdout 用 utf-8，但 cmd 显示层仍可能有问题）。装完后**新开一个 PowerShell 窗口**让 uv 进 PATH 生效。
-
-### macOS / Linux
+macOS / Linux：
 
 ```bash
 git clone https://github.com/wangxz01/cnsfindchina.git
 cd cnsfindchina
 curl -LsSf https://astral.sh/uv/install.sh | sh
-uv sync
+uv sync --locked
 uv run playwright install chromium
 uv run python src/unified_web.py
 ```
 
----
-
-新设备无需预装 Python 或 pip——uv 会按 `uv.lock` 装完全一致的依赖版本，按 `.python-version` 自动下载匹配的 Python。
-
-目录布局：
-```
-cnsfindchina/
-├── src/                  # 所有源码
-│   ├── unified_web.py    # 统一入口
-│   ├── scraper.py / nature_scraper.py / science_scraper.py
-│   ├── scraper_common.py / excel_writer.py
-│   └── static/           # 前端
-├── data/                 # 运行时产物（git 不入库；urls*.txt 入库）
-│   ├── urls.txt / urls_nature.txt / urls_science.txt
-│   ├── browser_profile{,_nature,_science}/   # 运行后生成
-│   ├── cache{,_nature,_science}/             # 运行后生成
-│   └── *_*.xlsx                               # 输出
-├── README.md
-├── pyproject.toml
-└── uv.lock
-```
-
-迁移不带的（已在 `.gitignore`）：
-- `data/browser_profile*/`（含 Cookie，新设备会重新过验证）
-- `data/cache*/`（已抓缓存）
-- `data/*.xlsx`（输出）
-
-## 运行：统一 Web 控制台（推荐）
+打开 `http://127.0.0.1:8000/`。项目使用 `.python-version` 指定的 Python 3.12 和 `uv.lock` 锁定依赖。
 
 ```bash
-python src/unified_web.py            # 默认 http://127.0.0.1:8000/
-python src/unified_web.py --port 8080
+uv run python src/unified_web.py --port 8080
 ```
 
-顶部 **Cell / Nature / Science** 按钮切换 source。每个 source 独立线程、独立浏览器、独立状态，**可同时启动三个并行跑**。正在运行的 source 按钮上有绿色脉动小圆点。
+## 使用网页
 
-操作流程：
-1. 选 source，编辑对应 `urls_*.txt`，点 **💾 保存到文件**
-2. 点 **▶ 开始抓取**，Playwright 窗口弹出
-3. CF / Cookie 墙触发时网页显眼提示；在 Playwright 窗口过验证后点 **✓ 我已通过验证**
-4. 抓取中表格实时填充，**中国一作的行有粉色背景**
-5. 完成后点 **⬇ 下载 Excel**
+1. 选择 Cell / Nature / Science，填写 issue URL，每行一个；支持空行与 `#` 注释。
+2. 点击“开始抓取”，程序保存配置后运行。三个来源可并行，同一来源只允许一个任务。
+3. 遇到人机验证，在爬虫浏览器中手动完成，然后点“我已通过验证”；也可跳过当前文章。
+4. 网页显示日期、国家判断及数据完整性；中国记录标粉色。
+5. 抓取结束后下载 Excel。“部分完成”表示仍有缺失字段、失败文章或数量校验差异。
+6. 点击停止后显示“正在停止”，到检查点保存已有记录，再显示“已取消”。导航请求自身有超时，停止不承诺立即中断正在进行的网络请求。
 
-## 运行：CLI 命令行
+刷新网页或 SSE 断线重连后，会从后端快照恢复已抓文章、日志与校验结果，不会因重复事件重复计数。
+这些网页快照保存在当前服务进程内；重启服务后不恢复旧任务界面，磁盘缓存与 Excel 保留。
 
-三个独立 CLI（不依赖 Web 服务）：
+“立即导出”在任务停止后，导出该来源缓存目录中的**所有历史记录**，不局限于文本框中的 issue；会按缓存记载的 issue 分组。旧缓存字段未验证时标“待核实”。运行中禁止清缓存和缓存导出，避免与抓取写入互相覆盖。
+
+## URL 格式与 CLI
+
+| 来源 | 配置文件 | issue URL 模式 |
+|---|---|---|
+| Cell | `data/urls.txt` | `https://www.sciencedirect.com/journal/cell/vol/<v>/issue/<i>` |
+| Nature | `data/urls_nature.txt` | `https://www.nature.com/nature/volumes/<v>/issues/<i>` |
+| Science | `data/urls_science.txt` | `https://www.science.org/toc/science/<v>/<i>` |
 
 ```bash
-uv run python src/scraper.py            # Cell    → data/cell_YYYY-MM-DD.xlsx
-uv run python src/nature_scraper.py     # Nature  → data/nature_YYYY-MM-DD.xlsx
-uv run python src/science_scraper.py    # Science → data/science_YYYY-MM-DD.xlsx
+uv run python src/scraper.py
+uv run python src/nature_scraper.py
+uv run python src/science_scraper.py
+# 可选参数：--out PATH / --fresh / --headless
 ```
 
-通用参数：`--out PATH` / `--fresh`（忽略缓存重抓）/ `--headless`（不推荐，过 CF 需可见）
+`--fresh` 忽略已有缓存。遇到人工验证时建议使用默认的可见浏览器。
 
-> Cell/Nature/Science 各自的 `web.py` / `nature_web.py` / `science_web.py` 已合并到 `unified_web.py`，单独的 web 入口已删除。
+## Excel 输出
 
-URL 输入文件（在 `data/` 下）：
-| Source | 文件 | URL 模式 |
-|---|---|---|
-| Cell | `data/urls.txt` | `sciencedirect.com/journal/cell/vol/<v>/issue/<i>` |
-| Nature | `data/urls_nature.txt` | `nature.com/nature/volumes/<v>/issues/<i>` |
-| Science | `data/urls_science.txt` | `science.org/toc/science/<v>/<i>` |
+默认 `data/<source>_YYYY-MM-DD.xlsx`，文件名日期是运行日期，和表格内的文章发布日期不同。
+同日重跑会替换同名文件；文件被 Excel 占用时改写到唯一后缀的备用文件，并返回实际路径。
+Excel 和 JSON 缓存均通过临时文件原子替换，降低中途异常损坏原文件的风险。
 
-每行一个 URL，`#` 开头为注释。
+- 第一个 sheet 为“汇总”：计划篇数、已取得记录、成功访问、失败、中国、非中国、国家待核实、数据待补全、数量校验与异常说明。“成功访问”不等于所有字段均已补齐。
+- 后续每个 issue 一个 sheet，命名如 `v189-i10`；第一行为 issue URL，第二行为表头，文章按 section 分组。
+- 基础字段：URL、标题、DOI、类型、第一作者、单位、国家、中国判断、作者列表。
+- Cell 额外两列日期；Nature / Science 额外一列日期；最后为提取状态、待补字段、日期来源。
+- 标题等外部文字按文本写入，不解释成 Excel 公式；冻结顶部表头，中国记录标粉色。
 
-## 断点续爬（按文章 ID 缓存）
+## 缓存与补抓
 
-每篇成功抓取的文章以 `cache[_nature|_science]/<id>.json` 存盘。重跑时：
+每篇按文章 ID 存入 `data/cache*/*.json`。缓存包含版本、来源、完整性、日期证据与作者单位关联信息。
 
-- **缓存命中**：直接读盘，**不开浏览器、不访问网络**，但仍写入 Excel
-- **缓存未命中**：正常抓取并写缓存
-- **CF 未通过 / 数据残缺**：不写缓存，下次重试
+- 当前版本且字段完整：跳过该文章页的网络访问。
+- 缺日期、缺单位、国别待核实等：保留已得字段供导出；重跑会重新访问该文章，合并此前验证过的字段。
+- 旧版本缓存：自动视为未命中，不用旧判断跳过日期补抓；无需手动清空全部缓存。
+- 人机验证未通过或导航失败：保留失败记录在当次结果中，不保存为成功缓存。
+- 即使所有文章缓存命中，程序仍启动浏览器并读取 issue 目录，以获得本期列表和校验依据。
+
+`data/browser_profile*` 保留浏览器 Cookie。缓存、Cookie、Excel 均不入 Git。
+
+## 数量校验
+
+文章列表通过浏览器 DOM 提取；独立路径使用 Python HTMLParser 遍历文章链接。两条路径遵循同一纳入范围，并比较**文章 ID 集合**，不只比较总数。
+
+- Cell：本刊 PII 链接，排除 Author / Publisher Correction。
+- Nature：各 section 的 `s41586-` 链接，排除 Author / Publisher Correction；不表示包括所有新闻等其他 DOI 前缀。
+- Science：各 section 的 `10.1126/science.*` 链接。
+- 排除 header / footer / nav / aside 与 `.card-related` 的链接。
+- 不一致时报告漏项和多项的 ID；`0/0` 不显示为校验成功。
+
+数量一致仅说明两条提取路径得到相同文章集合，不代表日期、作者单位完整，也不能排除页面尚未加载的共同遗漏。
+
+## 验证与代码结构
 
 ```bash
-# 全部重抓
-# Mac/Linux:
-rm -rf data/cache data/cache_nature data/cache_science
-# Windows PowerShell:
-#   Remove-Item -Recurse -Force data\cache, data\cache_nature, data\cache_science
-
-# 或加 --fresh
-uv run python src/scraper.py --fresh
-
-# 只重抓某篇
-# Mac/Linux:
-rm data/cache/S0092867426003946.json
-# Windows PowerShell:
-#   Remove-Item data\cache\S0092867426003946.json
+uv run python -m unittest discover -s tests -v
+# 用模拟数据手动检查 UI；不访问期刊网站，不修改正式 data 文件
+uv run python tests/preview_server.py
+# 打开 http://127.0.0.1:8765/
+# 真实文章单篇检查：打开本地浏览器，手动过验证后在终端按 Enter
+uv run python tests/live_check.py cell
+uv run python tests/live_check.py science
+# 可替换文章；已有验证 Cookie 时可自动开始
+uv run python tests/live_check.py cell --url https://www.sciencedirect.com/science/article/pii/S0092867426003946 --auto
 ```
 
-修改了 scraper 的字段提取逻辑后，旧缓存不会自动失效——请手动清缓存或加 `--fresh`。
+`tests/fixtures` 为自行构造的 HTML 样例，覆盖双日期、作者单位关系、勘误等情形。离线测试通过不代表出版商当前页面一定可访问；真实页面仍可能遇到验证、权限或结构变化。
 
-## 数量检验
+真实文章检查把提取前后 HTML、字段 JSON 和 Excel 留在 `data/live_checks/<source>/`，仅供本地诊断，不入 Git；同一来源再次检查会更新这些文件。Cell 新版页面的 `dates` 数据中，`Available online` 和 `Version of Record` 按各自的标签读取，值可以相同，也可以不同。
 
-每个 issue 加载完文章列表后，程序用**两种独立方法**计数并交叉验证，避免"用同一套选择器验证自己"的循环论证：
-
-| 方法 | 路径 | 用途 |
-|---|---|---|
-| DOM 提取 | `page.evaluate(JS)` → `document.querySelectorAll(selector)` → 遍历 DOM 树 | 实际爬取的文章列表 |
-| regex 独立计数 | `page.content()` → Python regex 扫描原始 HTML 字符串 | 交叉验证 |
-
-两条路径完全独立——如果 DOM 选择器漏抓文章（选择器写错、动态渲染未完成等），regex 仍能从原始 HTML 中发现它们，从而触发不一致告警。
-
-- **一致**：日志 `[check] 数量检验通过：N 篇 == 页面 N 篇`，Web 面板显示 `✓ N/N`
-- **不一致**：日志 `[warn] 数量检验不一致：DOM X 篇 vs 页面 Y 篇`，Web 面板显示 `⚠ DOM X vs 页面 Y`
-
-各 source 的 regex 模式：
-
-| Source | 模式 | 说明 |
-|---|---|---|
-| Cell | `/science/article/pii/S\d{16}` | PII 路径 |
-| Nature | `/articles/s41586-\d{3}-\d{4,7}-[a-z0-9]+` | 研究论文 DOI 前缀 |
-| Science | `/doi/10\.1126/science\.[a-z0-9]+` | 用 `/doi/` 前缀避开 meta 标签里的 issue DOI |
-
-## Cloudflare / Cookie 同意墙流程
-
-首次访问 Cell 几乎一定触发 Cloudflare；Nature/Science 有 Cookie 同意横幅。**程序采用"先提取后判定"策略**——尽量不打扰用户：
-
-### 两层检测
-
-1. **issue 列表页**：goto 后必检测。若被墙，弹提示等用户处理（必须先拿到列表才能继续）。
-2. **文章页**：goto 后**直接提取**，不主动判定 CF。只有 `extract_fields` 拿到的 title 是 `"Are you a robot?"` / `"Just a moment..."` 等（说明确实撞到挑战页），才进入用户处理流程。
-
-> 之所以不主动判定：`is_cloudflare` 偶尔误报（Cookie banner 残留 / 页脚 CF marker 字符串），导致明明页面正常也强行让用户介入。基于提取结果判定更精准。
-
-### 触发后的三种处理方式
-
-网页顶部出现醒目黄色提示（含目标 URL 和当前 URL）时，可以：
-
-1. **什么都不做，等自动消退** ⭐——程序每 0.3s 检测一次页面，CF 挑战页通常几十秒内自动消退，自动继续抓取。
-2. **切到 Playwright 浏览器手动处理**：
-   - Cloudflare：勾选复选框或等自动放行
-   - Cookie 墙：点 "Accept All" / "Manage Preferences" 关闭横幅
-   - 必要时手动把地址栏改回目标 URL 并回车
-   - 处理完回网页点 **✓ 我已通过验证**
-3. **点 ⏭ 跳过此文章**——把当前文章记为 `[CF BLOCKED]` 继续下一篇（不停整个任务）
-
-### 重试上限
-
-每篇文章最多重试 5 次；5 次后仍是挑战页则记 `[CF BLOCKED]` 继续。被记 BLOCKED 的文章**不写缓存**，下次重跑会重试。
-
-`browser_profile*/` 持久化 Cookie，通过后的 `cf_clearance` 通常会被记住，同域名后续访问可能免挑战。
-
-## 输出格式
-
-默认输出按运行日期命名：`<source>_YYYY-MM-DD.xlsx`（同日重跑会覆盖；若文件被 Excel 占用，自动写到 `<source>_YYYY-MM-DD.<时间戳>.xlsx` 并在日志/网页提示）。
-
-每个 issue 一个 sheet，命名 `v<v>-i<i>`（如 `v189-i10`）。每 sheet 内布局：
-
-| 行/列 | A | B | C | D | E | F | G | H | I |
-|---|---|---|---|---|---|---|---|---|---|
-| 1 | issue URL | | | | | | | | |
-| 2 | section 分类名（独占一行，如 Articles / Research Articles 等） | | | | | | | | |
-| 3+ | 文章 URL | 标题 | DOI | 类型 | 一作 | 一作单位 | 一作国家 | 是否中国 | 作者列表 |
-
-## 反 IP 封禁策略
-
-- 文章间随机停顿 6-25s（Science 拉长到 12-25s）
-- 每 4-5 篇插入 45-120s 长歇模拟阅读间歇
-- 进文章前 1.5-6s 随机停顿 + 鼠标抖动
-- 文章页 4-8 段慢速滚动模拟阅读
-- 点击 show-more / Expand All 前鼠标抖动
-- 所有固定 wait 全部带随机抖动
-- `navigator.webdriver` 隐藏
-- 三个 source 各自独立 profile，cookie 互不污染
-
-## 关键文件
-
-| 文件 | 作用 |
+| 文件 | 用途 |
 |---|---|
-| `src/unified_web.py` | **统一 Web 服务（推荐入口）** |
-| `src/static/unified_index.html` | 前端单页（Vue 3 CDN，无构建） |
-| `src/scraper.py` | Cell 抓取逻辑（CLI 入口 + 三套共用的 ScraperCallbacks / CF 检测 / 随机化辅助） |
-| `src/nature_scraper.py` | Nature 抓取逻辑 + 国别判定函数（`parse_country`） |
-| `src/science_scraper.py` | Science 抓取逻辑 |
-| `src/scraper_common.py` | 共用工具（缓存、URL 加载、DATA_DIR、safe_goto） |
-| `src/excel_writer.py` | Excel 输出（多 sheet + 自定义列 schema） |
-| `data/urls.txt` / `data/urls_nature.txt` / `data/urls_science.txt` | 各 source 的 issue URL 列表 |
-| `pyproject.toml` / `uv.lock` / `.python-version` | uv 依赖与 Python 版本管理 |
-| `data/browser_profile*/` | Playwright 持久化浏览器配置（运行后生成，不入库） |
-| `data/cache*/` | 按 PII/DOI 的文章缓存（运行后生成，不入库） |
-
-## 字段提取策略
-
-| 字段 | Cell | Nature | Science |
-|---|---|---|---|
-| 标题 | `citation_title` meta | `dc.title` meta | `dc.Title` meta |
-| DOI | `citation_doi` meta | `prism.doi` meta | URL 里直接含 |
-| 作者 | 内嵌 JSON `#name:author`（按 author-id 去重） | `dc.creator` meta | `dc.Creator` meta |
-| 一作单位 | JSON 内 `"id":"aff1"` 后首个 `textfn` | `<li id="Aff1">` 内 address | `#con1_content` 内首个 affiliation `<span property="name">` |
-| 一作国家 | `parse_country(aff)` —— Nature/Science/Cell 同口径 | 同左 | 同左 |
-
-Cell 文章页 JSON 数据已在首次加载 HTML 内嵌，无需点击 Show more；Science affiliation 通常 display:none 但已在 DOM，无需点 Expand All；只在直取失败时才作兜底点击。
+| `src/scraper.py` / `nature_scraper.py` / `science_scraper.py` | 各期刊页面提取与 CLI |
+| `src/article_metadata.py` | 日期、作者单位关联、完整性与集合校验 |
+| `src/countries.py` | 共用国家名解析 |
+| `src/scraper_common.py` | 缓存、取消检查与统一任务生命周期 |
+| `src/excel_writer.py` | 日期单元格、汇总页与原子输出 |
+| `src/unified_web.py` | 三来源任务管理、结果快照与 SSE |
+| `src/static/unified_index.html` | 网页控制台 |
+| `tests/test_regressions.py` | 离线回归验证 |

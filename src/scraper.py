@@ -26,7 +26,11 @@ from urllib.parse import urljoin
 
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
-from excel_writer import write_excel, NATURE_COLUMNS
+from excel_writer import write_excel, CELL_COLUMNS, column_widths
+NATURE_COLUMNS = CELL_COLUMNS
+from article_metadata import enrich_fields, finalize_fields, publication_dates, expected_article_ids, count_check, china_label
+from scraper_common import run_source, cancellable_sleep, merge_cached_fields, ScrapeCancelled
+
 # 共用辅助（避免与 scraper_common 循环 import：scraper_common 用 TYPE_CHECKING 引用本模块）
 from scraper_common import (
     cache_path as _common_cache_path,
@@ -40,13 +44,10 @@ from scraper_common import (
 )
 
 
-# 国别判定 lazy import（避免与 nature_scraper 循环 import）
+from countries import parse_country, is_china_country
+
 def _country_helpers():
-    try:
-        from nature_scraper import parse_country, is_china_country
-        return parse_country, is_china_country
-    except ImportError:
-        return (lambda aff: ""), (lambda c: False)
+    return parse_country, is_china_country
 
 # ---------- 常量 ----------
 
@@ -99,12 +100,12 @@ class ScraperCallbacks:
 
 def rwait(min_s: float, max_s: float) -> None:
     """在 [min_s, max_s] 秒间随机停顿。"""
-    time.sleep(random.uniform(min_s, max_s))
+    cancellable_sleep(random.uniform(min_s, max_s))
 
 
 def human_pause(page, min_s: float = 0.4, max_s: float = 1.6) -> None:
     """页面内的随机短停顿（用 wait_for_timeout，避免与 goto 冲突）。"""
-    page.wait_for_timeout(int(random.uniform(min_s, max_s) * 1000))
+    cancellable_sleep(random.uniform(min_s, max_s))
 
 
 def human_scroll(page, steps: int | None = None) -> None:
@@ -345,7 +346,22 @@ def extract_with_cf_retry(page, url: str, cb, section: str, extract_fn,
     extract_fields 拿到的 title 仍可能是 "Are you a robot?" 等——is_cloudflare
     未识别这种 Elsevier 挑战页，需要靠 title 兜底。
     """
-    fields = extract_fn(page, url)
+    def extract():
+        if cb.is_cancelled():
+            from scraper_common import ScrapeCancelled
+            raise ScrapeCancelled()
+        try:
+            return extract_fn(page, url)
+        except Exception as exc:
+            from scraper_common import ScrapeCancelled
+            if isinstance(exc, ScrapeCancelled):
+                raise
+            cb.log(f'[warn] 字段提取失败: {exc}')
+            return dict(url=url, title='[GOTO FAILED]', doi='', type=section,
+                        first_author='', first_aff='', first_author_country='',
+                        is_china=None, authors=[], extraction_error=str(exc)[:300])
+
+    fields = extract()
     if section:
         fields["type"] = section
     for attempt in range(1, max_retries + 1):
@@ -357,11 +373,11 @@ def extract_with_cf_retry(page, url: str, cb, section: str, extract_fn,
         if not wait_until_cf_clear(page, target_url=url, cb=cb,
                                    max_attempts=1, force=True):
             return None
-        human_pause_fn(1.2, 2.8)
-        fields = extract_fn(page, url)
+        human_pause_fn(page, 1.2, 2.8)
+        fields = extract()
         if section:
             fields["type"] = section
-    return None
+    return fields if not _is_challenge_title(fields.get('title', '')) else None
 
 
 # ---------- issue 列表抽取 ----------
@@ -383,6 +399,7 @@ def extract_article_list(page) -> list[tuple[str, str, str]]:
             );
             const out = [];
             for (const a of articles) {
+                if (a.closest('header, footer, nav, aside, .card-related')) continue;
                 let section = "";
                 for (const t of titles) {
                     // t 在 a 之前（a 相对 t 是 FOLLOWING）则更新；遇到 t 在 a 之后即停
@@ -427,14 +444,7 @@ def extract_article_list(page) -> list[tuple[str, str, str]]:
 
 
 def count_expected(page) -> int:
-    """独立计数：regex 扫描 page.content() 原始 HTML 中的所有 PII，去重后返回。
-
-    与 extract_article_list 的 DOM 选择器（querySelectorAll）路径独立——
-    直接扫描 HTML 字符串，能捕获 DOM 选择器遗漏的文章。
-    """
-    html = page.content()
-    piis = set(re.findall(r'/science/article/pii/(S\d{16})', html))
-    return len(piis)
+    return len(expected_article_ids(page.content(), 'cell'))
 
 
 # ---------- 文章字段抽取 ----------
@@ -509,7 +519,8 @@ def _click_show_more_js(page) -> bool:
         return bool(page.evaluate(
             """
             () => {
-                const btn = document.querySelector("#show-more-btn");
+            const btn = document.querySelector("#show-more-btn") ||
+                document.querySelector('.content-authors button[data-aa-button="icon-expand"]');
                 if (!btn) return false;
                 const text = (btn.textContent || "").toLowerCase();
                 if (!text.includes("show more") && !text.includes("show full")) return false;
@@ -528,8 +539,9 @@ def extract_fields(page, article_url: str) -> dict:
     fields = _extract_from_html(html)
     fields["url"] = article_url
 
-    # affiliation 缺失 -> 回退：JS 点击 #show-more-btn
-    if not fields["first_aff"]:
+    dates = publication_dates(html, 'cell')
+    # Dates can be hidden behind Show more even when affiliations are present.
+    if not fields["first_aff"] or not dates['available_online'] or not dates['version_of_record']:
         # 点击前先随机鼠标抖动，降低节律性
         random_mouse_jitter(page, moves=random.randint(2, 4))
         human_pause(page, 0.3, 1.0)
@@ -544,6 +556,21 @@ def extract_fields(page, article_url: str) -> dict:
                 m = re.search(r'"#name":"textfn","_":"([^"]+)"', html[pos:])
                 if m:
                     fields["first_aff"] = m.group(1)
+
+    # Some versions of ScienceDirect expose dates in an article-history popover.
+    # Read current labels; never click unrelated article/PDF/external links.
+    dates = publication_dates(html, 'cell')
+    if not dates['available_online'] or not dates['version_of_record']:
+        try:
+            history = page.get_by_role('button', name=re.compile(r'^(View )?(article|publication) history$|^Article info(?:rmation)?$', re.I))
+            if history.count() == 0:
+                history = page.get_by_role('link', name=re.compile(r'^(View )?(article|publication) history$', re.I))
+            if history.count() == 1:
+                history.click(timeout=3000)
+                page.wait_for_timeout(500)
+                html = page.content()
+        except Exception:
+            pass
 
     # 再兜底：DOM 选择器
     if not fields["first_aff"]:
@@ -563,7 +590,7 @@ def extract_fields(page, article_url: str) -> dict:
         except Exception:
             pass
 
-    return fields
+    return enrich_fields(fields, html, 'cell', parse_country)
 
 
 # ---------- 主流程 ----------
@@ -613,14 +640,12 @@ def process_issue(page, issue_url: str, use_cache: bool = True,
 
     all_articles = extract_article_list(page)
     targets = all_articles
-    # 数量检验：独立 regex 计数 vs DOM 提取计数（避免循环论证）
-    expected = count_expected(page)
-    cb.on_state({"phase": "count_check", "issue_url": issue_url,
-                 "expected": expected, "actual": len(targets)})
-    if expected != len(targets):
-        cb.log(f"[warn] 数量检验不一致：DOM 提取 {len(targets)} 篇 vs 页面 regex {expected} 篇")
+    check = count_check(page.content(), targets, 'cell', issue_url)
+    cb.on_state(check)
+    if not check['matched']:
+        cb.log(f"[warn] 数量检验：{check['actual']}/{check['expected']}；漏项 {check['missing_ids']}；多项 {check['extra_ids']}")
     else:
-        cb.log(f"[check] 数量检验通过：{len(targets)} 篇 == 页面 {expected} 篇")
+        cb.log(f"[check] 数量检验通过：{check['actual']} 篇")
     cb.log(f"[*] 共 {len(targets)} 篇文章（全部 section，不过滤）")
     for sec, url, ttl in targets:
         cb.log(f"      - [{sec}] {ttl[:60]}")
@@ -645,6 +670,7 @@ def process_issue(page, issue_url: str, use_cache: bool = True,
         if use_cache and pii:
             cached = load_from_cache(pii)
             if cached:
+                cached = dict(cached, issue_url=issue_url, section=section)
                 cache_hits += 1
                 cb.log(f"\n[{i}/{total}] [cache] {list_title[:70]}")
                 results.append((section, url, cached))
@@ -664,7 +690,7 @@ def process_issue(page, issue_url: str, use_cache: bool = True,
             fields = {
                 "url": url, "title": "[GOTO FAILED]", "doi": pii, "type": section,
                 "first_author": "", "first_aff": "", "first_author_country": "",
-                "is_china": False, "authors": [],
+                "is_china": None, "authors": [],
             }
             results.append((section, url, fields))
             cb.on_state({"phase": "article_done", "url": url,
@@ -692,13 +718,17 @@ def process_issue(page, issue_url: str, use_cache: bool = True,
 
         fields = extract_with_cf_retry(page, url, cb, section,
                                        extract_fields, human_pause, max_retries=5)
+        if cb.is_cancelled():
+            raise ScrapeCancelled()
         if fields is None:
             cb.log("        [error] 多次重试仍是挑战页，记为 [CF BLOCKED]")
             fields = {
                 "url": url, "title": "[CF BLOCKED]", "doi": pii, "type": section,
                 "first_author": "", "first_aff": "", "first_author_country": "",
-                "is_china": False, "authors": [],
+                "is_china": None, "authors": [],
             }
+        if use_cache:
+            fields = merge_cached_fields(CACHE_DIR, pii, fields)
         results.append((section, url, fields))
 
         cb.log(f"        标题(art): {fields['title'][:80]}")
@@ -711,7 +741,7 @@ def process_issue(page, issue_url: str, use_cache: bool = True,
         fields["section"] = section
         fields["issue_url"] = issue_url
         # 只在拿到真实数据时写缓存；CF BLOCKED 不写
-        if pii and fields.get("title") and fields["title"] != "[CF BLOCKED]":
+        if pii and fields.get("title") and fields["title"] not in ("[CF BLOCKED]", "[GOTO FAILED]"):
             save_to_cache(pii, fields)
 
         cb.on_state({"phase": "article_done", "url": url,
@@ -746,59 +776,11 @@ def run_scraper(urls: list[str], out_path: str | Path,
 
     返回 all_issues: [(issue_url, [(section, url, fields), ...]), ...]
     """
-    cb = cb or ScraperCallbacks()
-    out_path = str(out_path)
-    all_issues: list[tuple[str, list]] = []
+    return run_source(urls, out_path, cb or ScraperCallbacks(), use_cache, headless,
+                      source='cell', profile_dir=PROFILE_DIR,
+                      playwright_factory=sync_playwright, process_issue=process_issue,
+                      columns=NATURE_COLUMNS, col_widths=column_widths(CELL_COLUMNS))
 
-    with sync_playwright() as p:
-        ctx = p.chromium.launch_persistent_context(
-            user_data_dir=str(PROFILE_DIR),
-            headless=headless,
-            viewport={"width": 1366, "height": 900},
-            args=["--disable-blink-features=AutomationControlled"],
-        )
-        ctx.add_init_script(
-            "() => { Object.defineProperty(navigator, 'webdriver', {get: () => undefined}); }"
-        )
-        page = ctx.new_page()
-
-        for idx, issue_url in enumerate(urls, start=1):
-            if cb.is_cancelled():
-                cb.log("[*] 收到取消信号，停止整个抓取流程")
-                break
-            cb.log(f"\n========== issue {idx}/{len(urls)} ==========")
-            cb.on_state({"phase": "issue_progress", "issue_idx": idx,
-                         "issue_total": len(urls), "issue_url": issue_url})
-            results = process_issue(page, issue_url, use_cache=use_cache, cb=cb)
-            all_issues.append((issue_url, results))
-            actual_out = write_excel(out_path, all_issues, columns=NATURE_COLUMNS,
-                        col_widths=[55, 55, 25, 14, 18, 60, 14, 10, 50])
-            if actual_out != out_path:
-                cb.log(f"[warn] 原文件被占用，实际写入: {actual_out}")
-                out_path = actual_out
-            cb.log(f"\n[issue {idx}] 完成，共 {len(results)} 篇；已写入 {out_path}")
-            cb.on_state({"phase": "excel_written", "out_path": out_path,
-                         "issue_url": issue_url})
-            if idx < len(urls):
-                pause = random.uniform(20.0, 60.0)
-                cb.log(f"[*] issue 间长歇 {pause:.0f}s ...")
-                for _ in range(int(pause)):
-                    if cb.is_cancelled():
-                        break
-                    time.sleep(1)
-
-        ctx.close()
-
-    # 统计实际拿到的（非 BLOCKED/FAILED）文章数；为 0 视为异常
-    real_count = count_real_articles(all_issues)
-    if real_count == 0:
-        cb.log(f"\n[warn] 全部完成但 0 篇成功（可能 CF/cookie 墙未过或结构变化）")
-        cb.on_state({"phase": "all_skipped", "out_path": out_path,
-                     "reason": "0 篇文章抓取成功"})
-    else:
-        cb.log(f"\n[done] 全部完成（{real_count} 篇），结果写入 {out_path}")
-        cb.on_state({"phase": "all_done", "out_path": out_path})
-    return all_issues
 
 
 def main() -> int:

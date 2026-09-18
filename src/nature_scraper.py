@@ -36,7 +36,10 @@ from scraper import (
     detect_cf_in_html, is_cloudflare, wait_until_cf_clear,
     extract_with_cf_retry,
 )
-from excel_writer import write_excel, NATURE_COLUMNS
+from excel_writer import write_excel, NATURE_COLUMNS, column_widths
+from article_metadata import enrich_fields, finalize_fields, publication_dates, expected_article_ids, count_check, china_label
+from scraper_common import run_source, cancellable_sleep, merge_cached_fields, ScrapeCancelled
+
 # 共用辅助
 from scraper_common import (
     cache_path as _common_cache_path,
@@ -63,103 +66,7 @@ CACHE_DIR = DATA_DIR / "cache_nature"
 # ---------- 国别识别 ----------
 
 # 常见国家别名 → 规范名（用于 Nature Aff1 末段匹配）
-_COUNTRY_ALIASES = {
-    "china": "China",
-    "prc": "China",
-    "people's republic of china": "China",
-    "people s republic of china": "China",
-    "usa": "USA",
-    "u.s.a.": "USA",
-    "united states": "USA",
-    "united states of america": "USA",
-    "uk": "UK",
-    "u.k.": "UK",
-    "united kingdom": "UK",
-    "britain": "UK",
-    "great britain": "UK",
-    "germany": "Germany",
-    "france": "France",
-    "japan": "Japan",
-    "south korea": "South Korea",
-    "korea": "South Korea",
-    "republic of korea": "South Korea",
-    "india": "India",
-    "italy": "Italy",
-    "spain": "Spain",
-    "switzerland": "Switzerland",
-    "sweden": "Sweden",
-    "netherlands": "Netherlands",
-    "the netherlands": "Netherlands",
-    "australia": "Australia",
-    "canada": "Canada",
-    "brazil": "Brazil",
-    "russia": "Russia",
-    "russian federation": "Russia",
-    "singapore": "Singapore",
-    "israel": "Israel",
-    "iran": "Iran",
-    "saudi arabia": "Saudi Arabia",
-    "uae": "UAE",
-    "united arab emirates": "UAE",
-    "argentina": "Argentina",
-    "chile": "Chile",
-    "mexico": "Mexico",
-    "poland": "Poland",
-    "austria": "Austria",
-    "belgium": "Belgium",
-    "denmark": "Denmark",
-    "finland": "Finland",
-    "norway": "Norway",
-    "ireland": "Ireland",
-    "portugal": "Portugal",
-    "greece": "Greece",
-    "turkey": "Turkey",
-    "türkiye": "Turkey",
-    "czech republic": "Czech Republic",
-    "czechia": "Czech Republic",
-    "hungary": "Hungary",
-    "south africa": "South Africa",
-    "egypt": "Egypt",
-    "thailand": "Thailand",
-    "malaysia": "Malaysia",
-    "indonesia": "Indonesia",
-    "vietnam": "Vietnam",
-    "taiwan": "Taiwan",
-    "hong kong": "Hong Kong",
-    "p.r. china": "China",
-    "new zealand": "New Zealand",
-}
-
-
-def parse_country(affiliation: str) -> str:
-    """从 Affiliation 文本中提取国家。
-
-    规则：
-    1. 取逗号分隔的最后一个非空 segment（多数单位末段就是国家）
-    2. 清洗后与 _COUNTRY_ALIASES 匹配
-    3. 匹配不到则返回原文末段加 "?" 前缀（标记未识别，方便人工 review）
-    """
-    if not affiliation:
-        return ""
-    # 去掉邮编、数字
-    s = re.sub(r"\b\d{4,6}\b", "", affiliation).strip(" ,;")
-    parts = [p.strip() for p in s.split(",") if p.strip()]
-    if not parts:
-        return ""
-    # 从末尾向前找：连续两个 segment 都可能是国家（如 "TX, USA" → USA）
-    for cand in reversed(parts[-2:]):
-        key = re.sub(r"[^a-z ']", "", cand.lower()).strip()
-        if key in _COUNTRY_ALIASES:
-            return _COUNTRY_ALIASES[key]
-        # 也尝试整段去空格的常见变体
-        if "china" in key and "taiwan" not in key and "hong" not in key and "macau" not in key:
-            return "China"
-    # 兜底：返回最后一段原文，加 "?" 前缀让 Excel 一眼看出未识别
-    return f"?{parts[-1]}"
-
-
-def is_china_country(country: str) -> bool:
-    return country == "China"
+from countries import parse_country, is_china_country
 
 
 # ---------- issue 列表抽取 ----------
@@ -179,6 +86,7 @@ def extract_article_list(page) -> list[tuple[str, str, str]]:
             ));
             const out = [];
             for (const card of cards) {
+                if (card.closest('header, footer, nav, aside, .card-related')) continue;
                 const a = card.querySelector('a[href*="/articles/"]');
                 if (!a) continue;
                 const href = a.getAttribute('href') || '';
@@ -223,13 +131,7 @@ def extract_article_list(page) -> list[tuple[str, str, str]]:
 
 
 def count_expected(page) -> int:
-    """独立计数：regex 扫描 page.content() 原始 HTML 中的所有 s41586- 文章 ID，去重后返回。
-
-    与 extract_article_list 的 DOM 选择器路径独立。
-    """
-    html = page.content()
-    ids = set(re.findall(r'/articles/(s41586-\d{3}-\d{4,7}-[a-z0-9]+)', html))
-    return len(ids)
+    return len(expected_article_ids(page.content(), 'nature'))
 
 
 # ---------- 文章字段抽取 ----------
@@ -357,7 +259,7 @@ def extract_fields(page, article_url: str) -> dict:
                 fields["title"] = el.inner_text().strip()
         except Exception:
             pass
-    return fields
+    return enrich_fields(fields, html, 'nature', parse_country)
 
 
 # ---------- 缓存 ----------
@@ -399,14 +301,12 @@ def process_issue(page, issue_url: str, use_cache: bool = True,
 
     all_articles = extract_article_list(page)
     targets = all_articles
-    # 数量检验：独立 regex 计数 vs DOM 提取计数（避免循环论证）
-    expected = count_expected(page)
-    cb.on_state({"phase": "count_check", "issue_url": issue_url,
-                 "expected": expected, "actual": len(targets)})
-    if expected != len(targets):
-        cb.log(f"[warn] 数量检验不一致：DOM 提取 {len(targets)} 篇 vs 页面 regex {expected} 篇")
+    check = count_check(page.content(), targets, 'nature', issue_url)
+    cb.on_state(check)
+    if not check['matched']:
+        cb.log(f"[warn] 数量检验：{check['actual']}/{check['expected']}；漏项 {check['missing_ids']}；多项 {check['extra_ids']}")
     else:
-        cb.log(f"[check] 数量检验通过：{len(targets)} 篇 == 页面 {expected} 篇")
+        cb.log(f"[check] 数量检验通过：{check['actual']} 篇")
     cb.log(f"[*] 共 {len(targets)} 篇 s41586 文章（全部 section，不过滤）")
     for sec, url, ttl in targets:
         cb.log(f"      - [{sec}] {ttl[:60]}")
@@ -431,6 +331,7 @@ def process_issue(page, issue_url: str, use_cache: bool = True,
         if use_cache and article_id:
             cached = load_from_cache(article_id)
             if cached:
+                cached = dict(cached, issue_url=issue_url, section=section)
                 cache_hits += 1
                 cb.log(f"\n[{i}/{total}] [cache] {list_title[:70]}")
                 results.append((section, url, cached))
@@ -449,7 +350,7 @@ def process_issue(page, issue_url: str, use_cache: bool = True,
             fields = {
                 "url": url, "title": "[GOTO FAILED]", "doi": "", "type": section,
                 "first_author": "", "first_aff": "", "first_author_country": "",
-                "is_china": False, "authors": [],
+                "is_china": None, "authors": [],
             }
             results.append((section, url, fields))
             cb.on_state({"phase": "article_done", "url": url,
@@ -469,13 +370,17 @@ def process_issue(page, issue_url: str, use_cache: bool = True,
 
         fields = extract_with_cf_retry(page, url, cb, section,
                                        extract_fields, human_pause, max_retries=5)
+        if cb.is_cancelled():
+            raise ScrapeCancelled()
         if fields is None:
             cb.log("        [error] 多次重试仍是挑战页，记为 [CF BLOCKED]")
             fields = {
                 "url": url, "title": "[CF BLOCKED]", "doi": article_id, "type": section,
                 "first_author": "", "first_aff": "", "first_author_country": "",
-                "is_china": False, "authors": [],
+                "is_china": None, "authors": [],
             }
+        if use_cache:
+            fields = merge_cached_fields(CACHE_DIR, article_id, fields)
         results.append((section, url, fields))
 
         cb.log(f"        标题: {fields['title'][:80]}")
@@ -483,13 +388,13 @@ def process_issue(page, issue_url: str, use_cache: bool = True,
         cb.log(f"        类型: {fields['type']}  一作: {fields['first_author']}")
         cb.log(f"        单位: {fields['first_aff'][:120]}")
         cb.log(f"        国家: {fields['first_author_country']}  "
-               f"是否中国: {'是' if fields['is_china'] else '否'}")
+               f"是否中国: {china_label(fields['is_china'])}")
 
         # 让 cache 携带 section + issue_url，供"立即导出"按 issue 分组、按 section 分类
         fields["section"] = section
         fields["issue_url"] = issue_url
         # 只在拿到真实数据时写缓存
-        if article_id and fields.get("title") and fields["title"] != "[CF BLOCKED]":
+        if article_id and fields.get("title") and fields["title"] not in ("[CF BLOCKED]", "[GOTO FAILED]"):
             save_to_cache(article_id, fields)
 
         cb.on_state({"phase": "article_done", "url": url,
@@ -527,58 +432,11 @@ def load_urls() -> list[str]:
 def run_scraper(urls: list[str], out_path: str | Path,
                 cb: ScraperCallbacks | None = None,
                 use_cache: bool = True, headless: bool = False) -> list:
-    cb = cb or ScraperCallbacks()
-    out_path = str(out_path)
-    all_issues: list[tuple[str, list]] = []
+    return run_source(urls, out_path, cb or ScraperCallbacks(), use_cache, headless,
+                      source='nature', profile_dir=PROFILE_DIR,
+                      playwright_factory=sync_playwright, process_issue=process_issue,
+                      columns=NATURE_COLUMNS, col_widths=column_widths(NATURE_COLUMNS))
 
-    with sync_playwright() as p:
-        ctx = p.chromium.launch_persistent_context(
-            user_data_dir=str(PROFILE_DIR),
-            headless=headless,
-            viewport={"width": 1366, "height": 900},
-            args=["--disable-blink-features=AutomationControlled"],
-        )
-        ctx.add_init_script(
-            "() => { Object.defineProperty(navigator, 'webdriver', {get: () => undefined}); }"
-        )
-        page = ctx.new_page()
-
-        for idx, issue_url in enumerate(urls, start=1):
-            if cb.is_cancelled():
-                cb.log("[*] 收到取消信号，停止整个抓取流程")
-                break
-            cb.log(f"\n========== issue {idx}/{len(urls)} ==========")
-            cb.on_state({"phase": "issue_progress", "issue_idx": idx,
-                         "issue_total": len(urls), "issue_url": issue_url})
-            results = process_issue(page, issue_url, use_cache=use_cache, cb=cb)
-            all_issues.append((issue_url, results))
-            actual_out = write_excel(out_path, all_issues, columns=NATURE_COLUMNS,
-                        col_widths=[55, 55, 25, 14, 18, 60, 14, 10, 50])
-            if actual_out != out_path:
-                cb.log(f"[warn] 原文件被占用，实际写入: {actual_out}")
-                out_path = actual_out
-            cb.log(f"\n[issue {idx}] 完成，共 {len(results)} 篇；已写入 {out_path}")
-            cb.on_state({"phase": "excel_written", "out_path": out_path,
-                         "issue_url": issue_url})
-            if idx < len(urls):
-                pause = random.randint(30, 60)
-                cb.log(f"[*] issue 间长歇 {pause}s ...")
-                for _ in range(pause):
-                    if cb.is_cancelled():
-                        break
-                    time.sleep(1)
-
-        ctx.close()
-
-    real_count = count_real_articles(all_issues)
-    if real_count == 0:
-        cb.log(f"\n[warn] 全部完成但 0 篇成功（可能 CF/cookie 墙未过或结构变化）")
-        cb.on_state({"phase": "all_skipped", "out_path": out_path,
-                     "reason": "0 篇文章抓取成功"})
-    else:
-        cb.log(f"\n[done] 全部完成（{real_count} 篇），结果写入 {out_path}")
-        cb.on_state({"phase": "all_done", "out_path": out_path})
-    return all_issues
 
 
 def main() -> int:

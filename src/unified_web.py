@@ -13,6 +13,10 @@ import argparse
 import json
 import queue
 import threading
+import uuid
+import re
+from copy import deepcopy
+from urllib.parse import urlsplit
 from pathlib import Path
 from typing import Callable
 
@@ -25,6 +29,9 @@ import scraper as cell_mod
 import nature_scraper as nature_mod
 import science_scraper as science_mod
 from scraper import ScraperCallbacks
+from article_metadata import finalize_fields
+from excel_writer import column_widths
+from scraper_common import CACHE_VERSION
 
 
 # ---------- Source 配置 ----------
@@ -41,7 +48,7 @@ class SourceConfig:
         self.default_out = default_out
         self.run_scraper = run_scraper
         self.columns = columns
-        self.col_widths = col_widths
+        self.col_widths = column_widths(columns)
 
 
 # 9 列 NATURE_COLUMNS 的统一列宽（URL/标题/DOI/类型/一作/单位/国家/中国/作者列表）
@@ -85,14 +92,14 @@ SOURCES: dict[str, SourceConfig] = {
 class EventBus:
     def __init__(self):
         self._clients: list[queue.Queue] = []
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
 
     def subscribe(self) -> queue.Queue:
-        q: queue.Queue = queue.Queue()
-        # 先把所有 session 当前快照推过去
-        for k, s in SESSIONS.items():
-            q.put({"type": "state", "source": k, "data": s.snapshot()})
+        q = queue.Queue(maxsize=1000)
+        # Snapshot and registration share the same lock as all event mutations.
         with self._lock:
+            for key, session in SESSIONS.items():
+                q.put(dict(type='snapshot', source=key, data=session.snapshot(True)))
             self._clients.append(q)
         return q
 
@@ -101,13 +108,23 @@ class EventBus:
             if q in self._clients:
                 self._clients.remove(q)
 
-    def broadcast(self, event: dict) -> None:
+    def broadcast(self, event):
         with self._lock:
+            session = SESSIONS[event['source']]
+            session.revision += 1
+            event = dict(event, revision=session.revision, run_id=session.run_id)
             for q in self._clients:
-                try:
-                    q.put_nowait(event)
-                except queue.Full:
-                    pass
+                if q.full():
+                    # Replace missed events with complete snapshots. Bound memory.
+                    while True:
+                        try:
+                            q.get_nowait()
+                        except queue.Empty:
+                            break
+                    for key, current in SESSIONS.items():
+                        q.put_nowait(dict(type='snapshot', source=key, data=current.snapshot(True)))
+                else:
+                    q.put_nowait(deepcopy(event))
 
 
 # ---------- Session（每个 source 独立一份，互不影响） ----------
@@ -116,12 +133,17 @@ class EventBus:
 class Session:
     def __init__(self, source_key: str):
         self.source_key = source_key
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.thread: threading.Thread | None = None
         self.stop_event = threading.Event()
         self.cf_event = threading.Event()
         self.cf_skip_event = threading.Event()
 
+        self.run_id = ""
+        self.revision = 0
+        self.articles = {}
+        self.logs = []
+        self.count_checks = {}
         self.status: str = "idle"
         self.current_issue: str = ""
         self.issue_idx: int = 0
@@ -134,32 +156,26 @@ class Session:
         self.out_path: str = ""
         self.error_msg: str = ""
 
-    def set_status(self, status: str, **extra) -> None:
-        with self.lock:
+    def set_status(self, status, **extra):
+        with bus._lock, self.lock:
+            if self.stop_event.is_set() and self.thread is not None and status != 'cancelled':
+                status = 'stopping'
             self.status = status
-            for k, v in extra.items():
-                setattr(self, k, v)
-        # 通过 bus 广播（bus 在下方定义）
-        bus.broadcast({"type": "state", "source": self.source_key,
-                       "data": self.snapshot()})
+            for key, value in extra.items():
+                setattr(self, key, value)
+            bus.broadcast(dict(type='state', source=self.source_key, data=self.snapshot()))
 
-    def snapshot(self) -> dict:
+    def snapshot(self, include_results=False):
         with self.lock:
-            return {
-                "source": self.source_key,
-                "status": self.status,
-                "current_issue": self.current_issue,
-                "issue_idx": self.issue_idx,
-                "issue_total": self.issue_total,
-                "article_idx": self.article_idx,
-                "article_total": self.article_total,
-                "current_article_url": self.current_article_url,
-                "current_article_title": self.current_article_title,
-                "cf_info": self.cf_info,
-                "out_path": self.out_path,
-                "error_msg": self.error_msg,
-                "running": self.thread is not None and self.thread.is_alive(),
-            }
+            data = {key: deepcopy(getattr(self, key)) for key in (
+                'status', 'current_issue', 'issue_idx', 'issue_total', 'article_idx',
+                'article_total', 'current_article_url', 'current_article_title',
+                'cf_info', 'out_path', 'error_msg', 'run_id', 'revision')}
+            data.update(source=self.source_key, running=self.thread is not None)
+            if include_results:
+                data.update(articles=deepcopy(list(self.articles.values())), logs=list(self.logs),
+                            count_checks=deepcopy(self.count_checks))
+            return data
 
 
 # 先建 bus 与 SESSIONS（注意顺序：Session.set_status 引用 bus，需 bus 先于 Session 实例化）
@@ -175,21 +191,26 @@ class WebCallbacks(ScraperCallbacks):
         self.source_key = source_key
         self.session = SESSIONS[source_key]
 
-    def log(self, msg: str) -> None:
-        print(f"[{self.source_key}] {msg}")
-        bus.broadcast({"type": "log", "source": self.source_key, "data": msg})
+    def log(self, msg):
+        print(f'[{self.source_key}] {msg}')
+        with bus._lock, self.session.lock:
+            self.session.logs.append(msg)
+            del self.session.logs[:-1000]
+            bus.broadcast(dict(type='log', source=self.source_key, data=msg))
 
     def cf_wait(self, target_url: str, current_url: str,
                 attempt: int, max_attempts: int,
                 check_clear=None) -> str:
+        self.session.cf_event.clear()
+        self.session.cf_skip_event.clear()
         self.session.set_status(
             "cf_blocked",
             cf_info={"target": target_url, "current": current_url,
                      "attempt": attempt, "max_attempts": max_attempts},
         )
-        self.session.cf_event.clear()
-        self.session.cf_skip_event.clear()
         while True:
+            if self.session.stop_event.is_set():
+                return "cancelled"
             # 自动消退检测：每 0.3s 调一次，CF 自己消退就放行（无需用户操作）
             if check_clear is not None:
                 try:
@@ -200,6 +221,9 @@ class WebCallbacks(ScraperCallbacks):
                     pass
             # 用户按"✓ 我已通过验证"
             if self.session.cf_event.wait(timeout=0.3):
+                if self.session.stop_event.is_set():
+                    return "cancelled"
+                self.session.set_status("running", cf_info={})
                 return "user_resumed"
             # 用户按"⏭ 跳过此文章"
             if self.session.cf_skip_event.is_set():
@@ -217,6 +241,7 @@ class WebCallbacks(ScraperCallbacks):
             self.session.set_status(
                 "running",
                 current_issue=state.get("issue_url", ""),
+                article_idx=0, article_total=0, current_article_url="", current_article_title="", cf_info={},
                 issue_idx=state.get("issue_idx", 0),
                 issue_total=state.get("issue_total", 0),
             )
@@ -232,35 +257,22 @@ class WebCallbacks(ScraperCallbacks):
                 article_total=state.get("article_total", 0),
                 current_issue=state.get("issue_url", self.session.current_issue),
             )
-        elif phase == "count_check":
-            bus.broadcast({
-                "type": "count_check",
-                "source": self.source_key,
-                "data": {
-                    "issue_url": state.get("issue_url", ""),
-                    "expected": state.get("expected", 0),
-                    "actual": state.get("actual", 0),
-                },
-            })
-        elif phase == "article_done":
-            f = state.get("fields", {})
-            bus.broadcast({
-                "type": "article_done",
-                "source": self.source_key,
-                "data": {
-                    "url": state.get("url", ""),
-                    "title": f.get("title", ""),
-                    "doi": f.get("doi", ""),
-                    "type": f.get("type", ""),
-                    "first_author": f.get("first_author", ""),
-                    "first_aff": f.get("first_aff", ""),
-                    "first_author_country": f.get("first_author_country", ""),
-                    "is_china": f.get("is_china", False),
-                    "authors": f.get("authors", []),
-                    "cached": state.get("cached", False),
-                    "blocked": state.get("blocked", False),
-                },
-            })
+        elif phase == 'count_check':
+            with bus._lock, self.session.lock:
+                self.session.count_checks[state['issue_url']] = deepcopy(state)
+                bus.broadcast(dict(type='count_check', source=self.source_key, data=state))
+        elif phase == 'article_done':
+            fields = dict(state.get('fields', {}))
+            finalize_fields(fields, self.source_key)
+            item = dict(fields, url=state['url'], cached=state.get('cached', False),
+                        blocked=fields.get('extraction_status') == 'failed')
+            with bus._lock, self.session.lock:
+                key = (item.get('issue_url', self.session.current_issue), item['url'])
+                self.session.articles[key] = item
+                bus.broadcast(dict(type='article_done', source=self.source_key, data=item))
+        elif phase in ('partial_done', 'cancelled'):
+            self.session.set_status('partial' if phase == 'partial_done' else 'cancelled',
+                                    out_path=state.get('out_path', ''), error_msg=state.get('reason', ''))
         elif phase == "excel_written":
             self.session.set_status("running", out_path=state.get("out_path", ""))
         elif phase == "all_done":
@@ -285,11 +297,11 @@ def _worker(source_key: str, urls, out_path, use_cache):
         session.set_status("error", error_msg=str(e)[:300])
         cb.log(f"[error] 异常: {e!r}")
     finally:
-        with session.lock:
+        with bus._lock, session.lock:
             session.thread = None
-        # 任务结束，再广播一次最终状态（running=False）
-        bus.broadcast({"type": "state", "source": source_key,
-                       "data": session.snapshot()})
+            if session.stop_event.is_set():
+                session.status = 'cancelled'
+            bus.broadcast(dict(type='state', source=source_key, data=session.snapshot()))
 
 
 # ---------- FastAPI ----------
@@ -346,8 +358,33 @@ def get_urls(source: str = Query(...)):
 @app.post("/api/urls.txt")
 def save_urls(payload: dict, source: str = Query(...)):
     cfg = _resolve_source(source)
-    cfg.urls_file.write_text(payload.get("content", ""), encoding="utf-8")
+    content = payload.get('content', '')
+    if not isinstance(content, str):
+        raise HTTPException(400, 'content 必须是文本')
+    validate_urls(_parse_urls(content), source)
+    with bus._lock, SESSIONS[source].lock:
+        if SESSIONS[source].thread is not None:
+            raise HTTPException(409, '运行中不能修改 URL 列表')
+        cfg.urls_file.write_text(content, encoding='utf-8')
     return {"ok": True}
+
+
+def validate_urls(urls, source):
+    patterns = {
+        'cell': ('www.sciencedirect.com', r'/journal/cell/vol/\d+/issue/\d+/?'),
+        'nature': ('www.nature.com', r'/nature/volumes/\d+/issues/\d+/?'),
+        'science': ('www.science.org', r'/toc/science/\d+/\d+/?'),
+    }
+    host, pattern = patterns[source]
+    clean = []
+    for url in urls:
+        parts = urlsplit(url.strip())
+        if parts.scheme != 'https' or parts.netloc != host or not re.fullmatch(pattern, parts.path):
+            raise HTTPException(400, f'不是有效的 {source} issue URL: {url}')
+        normalized = f'https://{host}{parts.path.rstrip("/")}'
+        if normalized not in clean:
+            clean.append(normalized)
+    return clean
 
 
 def _parse_urls(text):
@@ -359,15 +396,10 @@ def _parse_urls(text):
 def start(payload: dict | None = None, source: str = Query(...)):
     cfg = _resolve_source(source)
     session = SESSIONS[source]
-    with session.lock:
-        if session.thread is not None and session.thread.is_alive():
-            raise HTTPException(
-                status_code=409,
-                detail=f"{source} 已有任务在运行"
-            )
-
-    if payload and payload.get("urls"):
-        urls = list(payload["urls"])
+    if payload and "urls" in payload:
+        urls = payload["urls"]
+        if not isinstance(urls, list) or not all(isinstance(u, str) for u in urls):
+            raise HTTPException(400, "urls 必须是 URL 字符串列表")
     else:
         text = cfg.urls_file.read_text(encoding="utf-8") if cfg.urls_file.exists() else ""
         urls = _parse_urls(text)
@@ -375,25 +407,38 @@ def start(payload: dict | None = None, source: str = Query(...)):
     if not urls:
         raise HTTPException(status_code=400, detail=f"{source} 没有有效的 issue URL")
 
+    urls = validate_urls(urls, source)
     out_path = (payload or {}).get("out") or cfg.default_out()
     out_path = str(Path(out_path).resolve())
     use_cache = not bool((payload or {}).get("fresh", False))
 
-    session.stop_event.clear()
-    session.cf_event.clear()
-    session.set_status(
-        "running",
-        current_issue="", issue_idx=0, issue_total=len(urls),
-        article_idx=0, article_total=0,
-        current_article_url="", current_article_title="",
-        cf_info={}, out_path=out_path, error_msg="",
-    )
-
-    t = threading.Thread(target=_worker, args=(source, urls, out_path, use_cache), daemon=True)
-    with session.lock:
+    with bus._lock, session.lock:
+        if session.thread is not None:
+            raise HTTPException(409, f'{source} 已有任务在运行或停止中')
+        session.stop_event.clear()
+        session.cf_event.clear()
+        session.cf_skip_event.clear()
+        session.run_id = uuid.uuid4().hex
+        session.articles.clear()
+        session.logs.clear()
+        session.count_checks.clear()
+        session.status = 'running'
+        session.current_issue = session.current_article_url = session.current_article_title = ''
+        session.issue_idx = session.article_idx = session.article_total = 0
+        session.issue_total = len(urls)
+        session.cf_info = {}
+        session.out_path = ''  # Do not offer a stale previous file as this run's output.
+        session.error_msg = ''
+        t = threading.Thread(target=_worker, args=(source, urls, out_path, use_cache), daemon=True)
         session.thread = t
-    t.start()
-    return {"ok": True, "out_path": out_path, "issue_total": len(urls), "source": source}
+        bus.broadcast(dict(type='snapshot', source=source, data=session.snapshot(True)))
+        try:
+            t.start()
+        except Exception:
+            session.thread = None
+            session.set_status('error', error_msg='无法启动抓取线程')
+            raise
+    return dict(ok=True, out_path=out_path, issue_total=len(urls), source=source, run_id=session.run_id)
 
 
 @app.post("/api/cf_resumed")
@@ -415,24 +460,31 @@ def cf_skip(source: str = Query(...)):
 @app.post("/api/stop")
 def stop(source: str | None = Query(None)):
     """停止指定 source；不传 source 则停止所有正在运行的。"""
-    targets = [source] if source else list(SESSIONS.keys())
+    if source:
+        _resolve_source(source)
+    targets = [source] if source else list(SESSIONS)
     stopped = []
-    for k in targets:
-        s = SESSIONS[k]
-        s.stop_event.set()
-        s.cf_event.set()  # 唤醒可能的 cf_wait
-        s.set_status("cancelled")
-        stopped.append(k)
-    return {"ok": True, "stopped": stopped}
+    with bus._lock:
+        for key in targets:
+            session = SESSIONS[key]
+            with session.lock:
+                if session.thread is None:
+                    continue
+                session.stop_event.set()
+                session.cf_event.set()
+                session.set_status('stopping')
+                stopped.append(key)
+    return dict(ok=True, stopped=stopped)
 
 
+@app.get("/api/results")
 @app.get("/api/status")
 def status(source: str | None = Query(None)):
     """不传 source 返回所有；传了返回单个。"""
     if source:
         _resolve_source(source)
-        return SESSIONS[source].snapshot()
-    return {k: v.snapshot() for k, v in SESSIONS.items()}
+        return SESSIONS[source].snapshot(True)
+    return {k: v.snapshot(True) for k, v in SESSIONS.items()}
 
 
 @app.get("/api/stream")
@@ -462,6 +514,8 @@ def download(source: str = Query(...)):
     session = SESSIONS[source]
     out = session.out_path
     if not out or not Path(out).exists():
+        if session.run_id:
+            raise HTTPException(404, '本次任务尚未生成输出文件')
         # 兜底：找该 source 的默认文件
         fallback = Path(SOURCES[source].default_out())
         if fallback.exists():
@@ -475,16 +529,32 @@ def download(source: str = Query(...)):
 
 @app.post("/api/reset_cache")
 def reset_cache(source: str = Query(...)):
+    with bus._lock, SESSIONS[_resolve_source(source).key].lock:
+        if SESSIONS[source].thread is not None:
+            raise HTTPException(409, "运行中不能清空缓存")
+        return _reset_cache(source)
+
+
+def _reset_cache(source):
     cfg = _resolve_source(source)
     if cfg.cache_dir.exists():
         for f in cfg.cache_dir.glob("*.json"):
-            try: f.unlink()
-            except Exception: pass
+            try:
+                f.unlink()
+            except OSError as exc:
+                raise HTTPException(500, f'未能删除缓存 {f.name}: {exc}') from exc
     return {"ok": True}
 
 
 @app.post("/api/export")
 def export_now(source: str = Query(...)):
+    with bus._lock, SESSIONS[_resolve_source(source).key].lock:
+        if SESSIONS[source].thread is not None:
+            raise HTTPException(409, "请先停止抓取，再导出缓存")
+        return _export_now(source)
+
+
+def _export_now(source):
     """立即从 cache 重建 Excel 并返回路径（中途手动导出）。
 
     遍历 cache 目录所有 JSON，按 issue URL 分组（每个 cache 文件含 url 字段），
@@ -506,10 +576,18 @@ def export_now(source: str = Query(...)):
             d = json.loads(f.read_text(encoding="utf-8"))
         except Exception:
             continue
+        if not isinstance(d, dict):
+            continue
+        if d.get('cache_version') != CACHE_VERSION:
+            d['affiliation_verified'] = False
+            d['is_china'] = None
+        finalize_fields(d, source)
         issue = d.get("issue_url") or ""
         section = d.get("section") or d.get("type") or ""
         groups[issue].append((section, d.get("url", ""), d))
 
+    if not groups:
+        raise HTTPException(404, "缓存中没有有效记录")
     fallback_label = f"export ({source} cache)"
     all_issues = [(iu or fallback_label, items) for iu, items in groups.items()]
 

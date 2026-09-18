@@ -92,6 +92,8 @@
   .st-cf_blocked { background: #fff4d4; color: #8a6300; }
   .st-done { background: #d4f4dd; color: #1a7a3e; }
   .st-error { background: #ffd4d4; color: #a02020; }
+  .st-stopping { background: #fff4d4; color: #8a6300; }
+  .st-partial { background: #fff4d4; color: #8a6300; }
   .st-cancelled { background: #eaeaec; color: #6e6e73; }
 
   .cf-banner {
@@ -204,8 +206,8 @@
         <h2>1 · 配置 urls.txt</h2>
         <textarea v-model="urlsText" placeholder="每行一个 issue URL，# 开头为注释"></textarea>
         <div class="btn-row">
-          <button class="btn-ghost btn-sm" @click="loadUrls" :disabled="busy">↺ 重新读取文件</button>
-          <button class="btn-ghost btn-sm" @click="saveUrls" :disabled="busy">💾 保存到文件</button>
+          <button class="btn-ghost btn-sm" @click="loadUrls()" :disabled="busy">↺ 重新读取文件</button>
+          <button class="btn-ghost btn-sm" @click="saveUrls()" :disabled="busy">💾 保存到文件</button>
         </div>
       </div>
 
@@ -223,8 +225,8 @@
           <span>Issue：<b>{{ state.issue_idx }}/{{ state.issue_total }}</b></span>
           <span>文章：<b>{{ state.article_idx }}/{{ state.article_total }}</b></span>
           <span v-if="countCheck">数量检验：
-            <b v-if="countCheck.actual === countCheck.expected" style="color: #1a7a3e;">✓ {{ countCheck.actual }}/{{ countCheck.expected }}</b>
-            <b v-else style="color: #a02020;">⚠ DOM {{ countCheck.actual }} vs 页面 {{ countCheck.expected }}</b>
+            <b v-if="countCheck.matched" style="color: #1a7a3e;">✓ {{ countCheck.actual }}/{{ countCheck.expected }}</b>
+            <b v-else style="color: #a02020;">⚠ DOM {{ countCheck.actual }} vs 页面 {{ countCheck.expected }}；漏项 {{ (countCheck.missing_ids || []).join(", ") }}；多项 {{ (countCheck.extra_ids || []).join(", ") }}</b>
           </span>
         </div>
         <div style="font-size: 13px; color: #6e6e73; margin-bottom: 12px; min-height: 20px;">
@@ -258,7 +260,7 @@
 
   <!-- 抓取结果表 -->
   <div class="card" style="margin-top: 16px;" v-if="articles.length">
-    <h2>本次已抓取（{{ articles.length }} 篇；中国一作 {{ chinaCount }} 篇）</h2>
+    <h2>本次已抓取（{{ articles.length }} 篇；中国一作 {{ chinaCount }} 篇；国家待核实 {{ unknownCount }} 篇）</h2>
     <table class="articles">
       <thead>
         <tr>
@@ -269,22 +271,30 @@
           <th style="width: 60px;">中国</th>
           <th style="width: 130px;">DOI</th>
           <th style="width: 260px;">一作单位</th>
+          <th v-if="currentSource === 'cell'">Available online</th>
+          <th v-if="currentSource === 'cell'">Version of Record</th>
+          <th v-if="currentSource !== 'cell'">发布日期</th>
+          <th>数据状态</th>
         </tr>
       </thead>
       <tbody>
-        <tr v-for="(a, i) in articles" :key="a.url"
+        <tr v-for="(a, i) in articles" :key="(a.issue_url || '') + a.url"
             :class="{ blocked: a.blocked, cached: a.cached && !a.blocked, 'china-row': a.is_china }">
           <td>{{ i + 1 }}</td>
           <td class="title">
             <a :href="a.url" target="_blank">{{ a.title || '(无标题)' }}</a>
             <span class="tag tag-cached" v-if="a.cached && !a.blocked">缓存</span>
-            <span class="tag tag-blocked" v-if="a.blocked">CF BLOCKED</span>
+            <span class="tag tag-blocked" v-if="a.blocked">抓取失败</span>
           </td>
           <td>{{ a.first_author }}</td>
           <td>{{ a.first_author_country }}</td>
-          <td><b v-if="a.is_china" style="color:#c93333;">是</b><span v-else style="color:#999;">否</span></td>
+          <td><b v-if="a.is_china === true" style="color:#c93333;">是</b><span v-else-if="a.is_china === false">否</span><span v-else style="color:#8a6300">待核实</span></td>
           <td>{{ a.doi }}</td>
           <td>{{ a.first_aff }}</td>
+          <td v-if="currentSource === 'cell'" :title="a.date_evidence?.available_online">{{ a.available_online || '待补全' }}</td>
+          <td v-if="currentSource === 'cell'" :title="a.date_evidence?.version_of_record">{{ a.version_of_record || '待补全' }}</td>
+          <td v-if="currentSource !== 'cell'" :title="a.date_evidence?.published_date">{{ a.published_date || '待补全' }}</td>
+          <td :title="(a.missing_fields || []).join(', ')">{{ {complete:'完整', partial:'待补全', failed:'抓取失败'}[a.extraction_status] || '待核实' }}</td>
         </tr>
       </tbody>
     </table>
@@ -298,7 +308,7 @@ createApp({
   setup() {
     // 三个 source 各自独立的状态桶；切换不丢数据
     const _emptyState = () => ({
-      status: 'idle',
+      status: 'idle', run_id: '', revision: 0,
       current_issue: '',
       issue_idx: 0,
       issue_total: 0,
@@ -335,19 +345,24 @@ createApp({
     });
     const logLines = computed(() => logsBySource[currentSource.value]);
     const articles = computed(() => articlesBySource[currentSource.value]);
-    const countCheck = computed(() => countChecksBySource[currentSource.value]);
+    const countCheck = computed(() => {
+      const check = countChecksBySource[currentSource.value];
+      return check?.issue_url === state.value.current_issue ? check : null;
+    });
 
-    const busy = computed(() => state.value.status === 'running' || state.value.status === 'cf_blocked');
+    const pending = reactive({cell:false, nature:false, science:false});
+    const busy = computed(() => pending[currentSource.value] || state.value.running || ['running', 'cf_blocked', 'stopping'].includes(state.value.status));
     const statusLabel = computed(() => ({
       idle: '空闲', running: '抓取中', cf_blocked: 'CF 等待',
-      done: '完成 ✓', error: '错误 ⚠', cancelled: '已取消',
+      done: '完成 ✓', partial: '部分完成，需核实', stopping: '正在停止', error: '错误 ⚠', cancelled: '已取消',
     }[state.value.status] || state.value.status));
     const progressPercent = computed(() => {
       const s = state.value;
       if (s.issue_total === 0) return 0;
       const t = (s.issue_idx - 1) + (s.article_total ? s.article_idx / s.article_total : 0);
-      return Math.min(100, Math.round(t / s.issue_total * 100));
+      return Math.max(0, Math.min(100, Math.round(t / s.issue_total * 100)));
     });
+    const unknownCount = computed(() => articles.value.filter(a => a.is_china == null).length);
     const chinaCount = computed(() => articles.value.filter(a => a.is_china).length);
 
     // 其它 source 是否在跑（用于在切换按钮上显示指示点）
@@ -367,86 +382,63 @@ createApp({
     }
 
     // ---- API ----
-    async function loadUrls(src) {
-      src = src || currentSource.value;
-      const r = await fetch(`/api/urls.txt?source=${src}`);
-      const j = await r.json();
-      urlsBySource[src] = j.content || '';
+    async function api(path, src, body) {
+      const suffix = src ? '?source=' + encodeURIComponent(src) : '';
+      const options = body === undefined ? {} : {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)};
+      const r = await fetch(path + suffix, options);
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.detail || r.statusText);
+      return data;
     }
-    async function saveUrls() {
-      const src = currentSource.value;
-      await fetch(`/api/urls.txt?source=${src}`, {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({content: urlsBySource[src]}),
-      });
-      pushLog(src, `[ui] 已保存 ${src} 的 urls.txt`);
+    async function loadUrls(src = currentSource.value) {
+      try { urlsBySource[src] = (await api('/api/urls.txt', src)).content || ''; }
+      catch (e) { pushLog(src, '[error] 读取失败: ' + e.message); }
+    }
+    async function saveUrls(src = currentSource.value) {
+      try {
+        await api('/api/urls.txt', src, {content:urlsBySource[src]});
+        pushLog(src, `[ui] 已保存 ${src} 的 urls.txt`);
+        return true;
+      } catch (e) { pushLog(src, '[error] 保存失败: ' + e.message); return false; }
     }
     async function start() {
       const src = currentSource.value;
-      articlesBySource[src] = [];
-      logsBySource[src] = [];
-      countChecksBySource[src] = null;
-      await saveUrls();
-      const r = await fetch(`/api/start?source=${src}`, {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({}),
-      });
-      if (!r.ok) {
-        const e = await r.json().catch(() => ({detail: r.statusText}));
-        pushLog(src, '[error] ' + (e.detail || r.status));
-      }
+      if (pending[src] || states[src].running) return;
+      pending[src] = true;
+      try {
+        if (!await saveUrls(src)) return;
+        await api('/api/start', src, {});
+        // The server's run snapshot clears the old result only after acceptance.
+        applySnapshot(src, await api('/api/status', src));
+      } catch(e) { pushLog(src, '[error] ' + e.message); }
+      finally { pending[src] = false; }
     }
-    async function stop() {
+    async function action(path, message, src = currentSource.value) {
+      try { await api(path, src, {}); pushLog(src || currentSource.value, message); }
+      catch (e) { pushLog(src || currentSource.value, '[error] ' + e.message); }
+    }
+    function stop() { return action('/api/stop', '[ui] 正在停止并保存已完成数据'); }
+    function stopAll() { return action('/api/stop', '[ui] 已请求停止所有来源', null); }
+    function resumeCf() { return action('/api/cf_resumed', '[ui] 已通知后端继续'); }
+    function skipCf() { return action('/api/cf_skip', '[ui] 已请求跳过此文章'); }
+    function resetCache() {
       const src = currentSource.value;
-      await fetch(`/api/stop?source=${src}`, {method: 'POST'});
-      pushLog(src, '[ui] 已请求停止（将在下一个检查点生效）');
+      if (confirm(`确认清空 ${src} 的缓存？下次会全部重抓。`)) return action('/api/reset_cache', '[ui] 缓存已清空', src);
     }
-    async function stopAll() {
-      await fetch('/api/stop', {method: 'POST'});
-      pushLog(currentSource.value, '[ui] 已请求停止所有 source');
-    }
-    async function resumeCf() {
-      const src = currentSource.value;
-      await fetch(`/api/cf_resumed?source=${src}`, {method: 'POST'});
-      pushLog(src, '[ui] 已通知后端继续');
-    }
-    async function skipCf() {
-      const src = currentSource.value;
-      await fetch(`/api/cf_skip?source=${src}`, {method: 'POST'});
-      pushLog(src, '[ui] 已跳过此文章，记为 BLOCKED');
-    }
-    async function resetCache() {
-      const src = currentSource.value;
-      if (!confirm(`确认清空 ${src} 的缓存？下次会全部重抓。`)) return;
-      await fetch(`/api/reset_cache?source=${src}`, {method: 'POST'});
-      pushLog(src, `[ui] ${src} 缓存已清空`);
-    }
-    function download() {
-      window.open(`/api/download?source=${currentSource.value}`, '_blank');
-    }
+    function download() { window.open(`/api/download?source=${currentSource.value}`, '_blank'); }
     async function exportNow() {
       const src = currentSource.value;
-      pushLog(src, '[ui] 正在从缓存重建 Excel...');
+      pending[src] = true;
       try {
-        const r = await fetch(`/api/export?source=${src}`, {method: 'POST'});
-        const j = await r.json();
-        if (r.ok) pushLog(src, `[ui] 已导出 ${j.count} 篇到 ${j.out_path}`);
-        else pushLog(src, `[error] 导出失败: ${j.detail || r.status}`);
-      } catch (e) { pushLog(src, `[error] ${e}`); }
+        const j = await api('/api/export', src, {});
+        pushLog(src, `[ui] 已导出 ${j.count} 篇到 ${j.out_path}`);
+        applySnapshot(src, await api('/api/status', src));
+      } catch(e) { pushLog(src, '[error] 导出失败: ' + e.message); }
+      finally { pending[src] = false; }
     }
     async function switchSource(key) {
-      // 完全无阻塞切换：三个 source 独立，无需停止当前
       currentSource.value = key;
       if (!urlsBySource[key]) await loadUrls(key);
-      pushLog(key, `[ui] 切换查看 ${key}`);
-      // 同步当前 source 的最新状态
-      try {
-        const r = await fetch(`/api/status?source=${key}`);
-        const j = await r.json();
-        Object.assign(states[key], j);
-      } catch {}
     }
 
     function pushLog(src, msg) {
@@ -458,56 +450,53 @@ createApp({
       }
     }
 
-    // ---- SSE ----
+    // A reconnect always starts with an atomic full snapshot. Upsert live rows.
+    function applySnapshot(src, snapshot, revision = snapshot.revision || 0) {
+      if (revision < states[src].revision) return;
+      const {articles: rows, logs, count_checks: checks, ...stateData} = snapshot;
+      Object.assign(states[src], stateData, {revision});
+      if (rows) articlesBySource[src] = rows;
+      if (logs) logsBySource[src] = logs;
+      if (checks) {
+        const values = Object.values(checks);
+        countChecksBySource[src] = values[values.length - 1] || null;
+      }
+    }
     function connectSSE() {
       const es = new EventSource('/api/stream');
       es.onmessage = (ev) => {
         let d;
         try { d = JSON.parse(ev.data); } catch { return; }
         const src = d.source;
-        if (!src) return;
-
-        if (d.type === 'log') {
-          logsBySource[src].push(d.data);
-          // 截断：每个 source 最多 1000 条
-          if (logsBySource[src].length > 1000) {
-            logsBySource[src].splice(0, logsBySource[src].length - 1000);
-          }
-          // 只为当前 source 自动滚到底
-          if (src === currentSource.value) {
-            nextTick(() => {
-              const el = logEl.value;
-              if (el) el.scrollTop = el.scrollHeight;
-            });
-          }
-        } else if (d.type === 'state') {
-          // 所有 source 的 state 都更新（这样切换时无需重新请求）
-          Object.assign(states[src], d.data);
-        } else if (d.type === 'article_done') {
-          articlesBySource[src].push(d.data);
-        } else if (d.type === 'count_check') {
-          countChecksBySource[src] = d.data;
+        if (!states[src]) return;
+        if (d.type === 'snapshot') {
+          applySnapshot(src, d.data, d.revision ?? d.data.revision);
+          return;
         }
+        if ((d.revision || 0) <= states[src].revision) return;
+        if (d.run_id !== states[src].run_id) return;
+        states[src].revision = d.revision;
+        if (d.type === 'log') {
+          pushLog(src, d.data);
+          if (src === currentSource.value) nextTick(() => { if (logEl.value) logEl.value.scrollTop = logEl.value.scrollHeight; });
+        } else if (d.type === 'state') {
+          Object.assign(states[src], d.data, {revision:d.revision});
+        } else if (d.type === 'article_done') {
+          const rows = articlesBySource[src];
+          const idx = rows.findIndex(a => a.url === d.data.url && a.issue_url === d.data.issue_url);
+          if (idx < 0) rows.push(d.data); else rows[idx] = d.data;
+        } else if (d.type === 'count_check') countChecksBySource[src] = d.data;
       };
-      es.onerror = () => { /* 浏览器自动重连 */ };
     }
-
     onMounted(async () => {
-      // 三个 source 的 urls 都加载（切换时无需等待）
-      await Promise.all(['cell', 'nature', 'science'].map(k => loadUrls(k)));
       connectSSE();
-      // 拉一次所有 source 的状态
-      try {
-        const r = await fetch('/api/status');
-        const j = await r.json();
-        for (const k of Object.keys(j)) Object.assign(states[k], j[k]);
-      } catch {}
+      await Promise.all(['cell', 'nature', 'science'].map(k => loadUrls(k)));
     });
 
     return {
       state, states, urlsText, logLines, articles, countCheck, logEl,
       sources, currentSource, runningSources, cfBlockedSources,
-      busy, statusLabel, progressPercent, lineClass, chinaCount,
+      busy, statusLabel, progressPercent, lineClass, chinaCount, unknownCount,
       loadUrls, saveUrls, start, stop, stopAll, resumeCf, skipCf, resetCache, download, exportNow,
       switchSource,
     };

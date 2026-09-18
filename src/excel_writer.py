@@ -1,101 +1,141 @@
-"""Excel 输出（方案 A 布局）。
+"""Excel output: summary plus one sheet per issue, with native date cells."""
+from __future__ import annotations
 
-布局：
-  每个 issue 一个 sheet（按 vol/issue 命名）
-  Row 1, Col A                 = issue URL
-  之后按 section 出现顺序：
-    分类名独占一行（Col A）
-    每篇文章一行：按 columns schema 渲染
-"""
+import os
 import re
+import tempfile
 import time
+from datetime import date
 from pathlib import Path
 
 import openpyxl
+from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
+from article_metadata import china_label, FAILED_TITLES
 
-
-# 列 schema：(表头, 取值键或 callable)
-# - 字符串键：直接从 fields dict 取；特殊键 "authors_joined" 自动 join
-# - callable：fields dict -> 单元格值
-DEFAULT_COLUMNS = [
-    ("URL", "url"),
-    ("标题", "title"),
-    ("DOI", "doi"),
-    ("作者", "authors_joined"),
-    ("首条单位", "first_aff"),
+BASE_COLUMNS = [
+    ("相关网址", "url"), ("标题", "title"), ("DOI", "doi"), ("类型", "type"),
+    ("第一作者", "first_author"), ("第一作者单位（未核实见状态列）", "first_aff"),
+    ("国家", "first_author_country"), ("是否中国", "is_china_label"), ("所有作者", "authors_joined"),
 ]
-
-NATURE_COLUMNS = [
-    ("相关网址", "url"),
-    ("原始数据-标题", "title"),
-    ("原始数据-DOI", "doi"),
-    ("原始数据-类型", "type"),
-    ("原始数据-第一作者", "first_author"),
-    ("原始数据-第一完成单位", "first_aff"),
-    ("提取-国家", "first_author_country"),
-    ("判断-是否中国", "is_china_label"),
-    ("原始数据-所有作者", "authors_joined"),
-]
+QUALITY_COLUMNS = [("提取状态", "extraction_status"), ("待补字段", "missing_fields"), ("日期来源", "date_evidence")]
+CELL_COLUMNS = BASE_COLUMNS + [("Available online", "available_online"), ("Version of Record", "version_of_record")] + QUALITY_COLUMNS
+NATURE_COLUMNS = BASE_COLUMNS + [("发布日期", "published_date")] + QUALITY_COLUMNS
+DEFAULT_COLUMNS = NATURE_COLUMNS
+DATE_FIELDS = {"available_online", "version_of_record", "published_date"}
 
 
-def _sheet_name_from_url(url: str) -> str:
-    # Cell 格式：/vol/X/issue/Y
-    m = re.search(r"/vol(?:umes)?/(\d+)/issues?/(\d+)", url)
+def column_widths(columns):
+    widths = {"url": 55, "title": 55, "doi": 25, "type": 18, "first_author": 22,
+              "first_aff": 65, "first_author_country": 22, "is_china_label": 12,
+              "authors_joined": 50, "extraction_status": 15, "missing_fields": 40, "date_evidence": 55}
+    return [widths.get(key, 19) for _, key in columns]
+
+
+def _sheet_name_from_url(url):
+    m = re.search(r"/vol(?:umes)?/(\d+)/issues?/(\d+)|/toc/science/(\d+)/(\d+)", url)
     if m:
-        return f"v{m.group(1)}-i{m.group(2)}"
-    parts = url.rstrip("/").split("/")
-    name = "-".join(parts[-2:]) or "issue"
-    return name[:31]  # Excel sheet 名最长 31 字符
+        volume, issue = (m.group(1), m.group(2)) if m.group(1) else (m.group(3), m.group(4))
+        return f"v{volume}-i{issue}"
+    return re.sub(r"[\\/*?:\[\]]", "-", "-".join(url.rstrip("/").split("/")[-2:]))[:31] or "issue"
 
 
-def _cell_value(key, f: dict):
+def _cell_value(key, fields):
     if callable(key):
-        return key(f)
+        return key(fields)
     if key == "authors_joined":
-        return "; ".join(f.get("authors", []))
+        return "; ".join(fields.get("authors", []))
     if key == "is_china_label":
-        return "是" if f.get("is_china") else "否"
-    return f.get(key, "")
+        return china_label(fields.get("is_china"))
+    value = fields.get(key, "")
+    if key in DATE_FIELDS:
+        try:
+            return date.fromisoformat(value) if value else None
+        except (ValueError, TypeError):
+            return None
+    if key == "extraction_status":
+        return {"complete": "完整", "partial": "待补全", "failed": "抓取失败"}.get(value, "待核实")
+    if isinstance(value, dict):
+        return "; ".join(f"{k}: {v}" for k, v in value.items())
+    if isinstance(value, list):
+        return "; ".join(map(str, value))
+    return value
 
 
-def write_one_sheet(wb, issue_url: str, results: list,
-                    columns=DEFAULT_COLUMNS, col_widths=None) -> None:
+def _append(ws, values):
+    ws.append(values)
+    for cell in ws[ws.max_row]:
+        # External titles/affiliations must be written as text, never Excel formulas.
+        if isinstance(cell.value, str):
+            cell.data_type = 's'
+        if isinstance(cell.value, date):
+            cell.number_format = 'yyyy-mm-dd'
+        cell.alignment = Alignment(vertical='top', wrap_text=True)
+
+
+def write_one_sheet(wb, issue_url, results, columns=DEFAULT_COLUMNS, col_widths=None):
     ws = wb.create_sheet(_sheet_name_from_url(issue_url))
-    ws.append([issue_url])
-    ws.append([name for name, _ in columns])  # 表头行（每个 sheet 仅顶部一次）
+    _append(ws, [issue_url])
+    _append(ws, [name for name, _ in columns])
+    for cell in ws[2]:
+        cell.font = Font(bold=True)
     last_section = None
-    for section, url, f in results:
+    for section, url, fields in results:
         if section != last_section:
-            ws.append([section])
+            _append(ws, [section])
             last_section = section
-        ws.append([_cell_value(k, f) for _, k in columns])
+        fields = dict(fields, url=url)
+        _append(ws, [_cell_value(key, fields) for _, key in columns])
+        if fields.get('is_china') is True:
+            for cell in ws[ws.max_row]:
+                cell.fill = PatternFill('solid', fgColor='FFF0F0')
+    for i, width in enumerate(col_widths or column_widths(columns), 1):
+        ws.column_dimensions[get_column_letter(i)].width = width
+    ws.freeze_panes = 'A3'
 
-    widths = col_widths or [60] * len(columns)
-    for i, w in enumerate(widths, start=1):
-        ws.column_dimensions[get_column_letter(i)].width = w
+
+def write_summary(wb, all_issues, issue_meta):
+    ws = wb.active
+    ws.title = '汇总'
+    _append(ws, ['统计口径：署名第一作者；任一明确关联单位在中国则计入；未知不计为否。'])
+    headers = ['Issue URL', '计划篇数', '已取得记录', '成功访问', '抓取失败', '中国', '非中国', '国家待核实', '数据待补全', '数量校验', '异常说明']
+    _append(ws, headers)
+    for url, results in all_issues:
+        fields = [f for _, _, f in results]
+        success = [f for f in fields if f.get('title') and f['title'] not in FAILED_TITLES]
+        meta = issue_meta.get(url, {})
+        check = meta.get('count_check')
+        check_label = ('通过' if check.get('matched') else f"不一致 {check['actual']}/{check['expected']}") if check else '未校验'
+        _append(ws, [url, meta.get('expected'), len(fields), len(success), len(fields)-len(success),
+                     sum(f.get('is_china') is True for f in success), sum(f.get('is_china') is False for f in success),
+                     sum(f.get('is_china') is None for f in fields),
+                     sum(f.get('extraction_status') != 'complete' for f in fields), check_label, meta.get('error', '')])
+    ws.column_dimensions['A'].width = 65
+    for i in range(2, len(headers)+1):
+        ws.column_dimensions[get_column_letter(i)].width = 20
+    ws.freeze_panes = 'B3'
+    ws.auto_filter.ref = f'A2:K{max(2, ws.max_row)}'
 
 
-def write_excel(out_path: str, all_issues: list,
-                columns=DEFAULT_COLUMNS, col_widths=None) -> str:
-    """all_issues: [(issue_url, results), ...]。每个 issue 一个 sheet。
-
-    返回实际写入的路径（若 out_path 被占用，会改写到带时间戳的备用文件）。
-    """
+def write_excel(out_path, all_issues, columns=DEFAULT_COLUMNS, col_widths=None, issue_meta=None):
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     wb = openpyxl.Workbook()
-    wb.remove(wb.active)  # 删除默认 sheet
+    write_summary(wb, all_issues, issue_meta or {})
     for issue_url, results in all_issues:
-        write_one_sheet(wb, issue_url, results, columns=columns, col_widths=col_widths)
-
+        write_one_sheet(wb, issue_url, results, columns, col_widths)
+    fd, temp = tempfile.mkstemp(dir=out_path.parent, suffix='.xlsx')
+    os.close(fd)
     try:
-        wb.save(out_path)
-        return out_path
-    except PermissionError:
-        # 文件被占用（如 Excel 打开中）→ 写到带时间戳的备用文件
-        ts = time.strftime("%Y%m%d_%H%M%S")
-        alt = str(Path(out_path).with_suffix(f".{ts}.xlsx"))
-        print(f"[warn] {out_path} 被占用，改写到: {alt}")
-        wb.save(alt)
-        return alt
-
-
+        wb.save(temp)
+        try:
+            os.replace(temp, out_path)
+        except PermissionError:
+            out_path = out_path.with_name(f'{out_path.stem}.{time.time_ns()}.xlsx')
+            os.replace(temp, out_path)
+            print(f'[warn] 文件被占用，改写到: {out_path}')
+        return str(out_path)
+    finally:
+        wb.close()
+        if os.path.exists(temp):
+            os.unlink(temp)
