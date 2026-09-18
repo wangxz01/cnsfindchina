@@ -389,7 +389,7 @@ def process_issue(page, issue_url: str, use_cache: bool = True,
         if cb.is_cancelled():
             raise ScrapeCancelled()
         if fields is None:
-            cb.log("        [error] 多次重试仍是挑战页，记为 [CF BLOCKED]")
+            cb.log("        [warn] 用户主动跳过验证，记为 [CF BLOCKED]，不写入缓存")
             fields = {
                 "url": url, "title": "[CF BLOCKED]", "doi": doi, "type": section,
                 "first_author": "", "first_aff": "", "first_author_country": "",

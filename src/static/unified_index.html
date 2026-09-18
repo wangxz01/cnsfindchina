@@ -195,9 +195,9 @@
 
   <!-- CF 弹窗 -->
   <div class="cf-banner" v-if="state.status === 'cf_blocked'">
-    <h3>⚠️ 浏览器触发了 Cloudflare 验证（第 {{ state.cf_info.attempt }}/{{ state.cf_info.max_attempts }} 次）</h3>
+    <h3>⚠️ 等待人工完成 Cloudflare 验证</h3>
     <p style="margin: 4px 0 8px; font-size: 13px;">
-      挑战页常会自动消退——程序每 0.3s 检测一次，无需操作。也可在浏览器里手动通过验证，或点"跳过此文章"放弃本篇继续下一篇。
+      请在爬虫浏览器中完成验证。程序会持续等待，确认目标论文已加载后才继续；不会因重试次数耗尽自动跳过。也可以主动跳过本篇或停止任务。
     </p>
     <p style="margin: 4px 0; font-size: 12px;">
       <b>目标 URL：</b><code>{{ state.cf_info.target || '(未知)' }}</code>
@@ -216,9 +216,9 @@
     <div>
       <div class="card">
         <h2>1 · 配置 urls.txt</h2>
-        <details class="catalog" v-if="currentSource === 'cell'">
+        <details class="catalog">
           <summary>从目录选期 · 不用手写网址</summary>
-          <p>读取 <a href="https://www.sciencedirect.com/journal/cell/issues" target="_blank" rel="noopener">Cell 官方目录</a>，选择年份和期号后追加到下方。原有网址和注释会保留，重复网址自动跳过。</p>
+          <p>读取 <a :href="catalogArchiveUrl" target="_blank" rel="noopener">{{ currentSourceLabel }} 官方目录</a>，选择年份和期号后追加到下方。原有网址和注释会保留，重复网址自动跳过。</p>
           <div class="btn-row">
             <button class="btn-primary btn-sm" @click="readCatalog('years')" :disabled="busy || catalogBusy">{{ catalog.years.length ? '刷新年份目录' : '读取年份目录' }}</button>
             <button v-if="catalogBusy" class="btn-ghost btn-sm" @click="cancelCatalog" :disabled="catalogPending || catalog.status === 'stopping'">取消读取</button>
@@ -298,7 +298,7 @@
           <span v-else-if="state.out_path">输出：<code style="font-size: 11px;">{{ state.out_path }}</code></span>
         </div>
         <div class="btn-row">
-          <button class="btn-primary" @click="start" :disabled="busy || (currentSource === 'cell' && catalogBusy)">▶ 开始抓取</button>
+          <button class="btn-primary" @click="start" :disabled="busy || catalogBusy">▶ 开始抓取</button>
           <button class="btn-danger" @click="stop" :disabled="!busy">■ 停止当前</button>
           <button class="btn-danger" @click="stopAll" v-if="runningSources.length > 1">■ 停止全部</button>
           <button class="btn-ghost" @click="resetCache" :disabled="busy">🗑 清空缓存</button>
@@ -453,13 +453,22 @@ createApp({
       if (!r.ok) throw new Error(data.detail || r.statusText);
       return data;
     }
-    const catalog = reactive({years: [], years_complete: false, issues: {}, running: false, status: 'idle', message: '', error: ''});
-    const catalogYears = ref([]), selectedIssues = ref([]);
-    const catalogPending = ref(false), catalogError = ref(''), catalogNotice = ref('');
-    const catalogBusy = computed(() => catalogPending.value || catalog.running);
-    const catalogExisting = computed(() => existingUrls(urlsBySource.cell));
-    const unloadedYears = computed(() => catalogYears.value.filter(y => !catalog.issues[String(y)]));
-    const visibleIssues = computed(() => catalogYears.value.slice().sort((a,b) => b-a).flatMap(y => catalog.issues[String(y)] || []));
+    const catalogs = reactive(Object.fromEntries(sources.value.map(s => [s.key, {
+      data:{years: [], years_complete: false, issues: {}, running: false, status: 'idle', message: '', error: ''},
+      years:[], selected:[], pending:false, error:'', notice:'',
+    }])));
+    const catalog = computed(() => catalogs[currentSource.value].data);
+    function catalogField(field) {
+      return computed({get: () => catalogs[currentSource.value][field], set: value => { catalogs[currentSource.value][field] = value; }});
+    }
+    const catalogYears = catalogField('years'), selectedIssues = catalogField('selected');
+    const catalogPending = catalogField('pending'), catalogError = catalogField('error'), catalogNotice = catalogField('notice');
+    const catalogBusy = computed(() => catalogPending.value || catalog.value.running);
+    const catalogArchiveUrl = computed(() => ({cell:'https://www.sciencedirect.com/journal/cell/issues', nature:'https://www.nature.com/nature/volumes', science:'https://www.science.org/loi/science'}[currentSource.value]));
+    const currentSourceLabel = computed(() => sources.value.find(s => s.key === currentSource.value).label);
+    const catalogExisting = computed(() => existingUrls(urlsBySource[currentSource.value]));
+    const unloadedYears = computed(() => catalogYears.value.filter(y => !catalog.value.issues[String(y)]));
+    const visibleIssues = computed(() => catalogYears.value.slice().sort((a,b) => b-a).flatMap(y => catalog.value.issues[String(y)] || []));
     const catalogGroups = computed(() => {
       const groups = new Map();
       for (const row of visibleIssues.value) {
@@ -482,43 +491,47 @@ createApp({
       }
       selectedIssues.value = [...selection];
     }
-    let catalogTimer;
-    function applyCatalog(data) {
-      const firstLoad = !catalog.years.length;
-      Object.assign(catalog, data);
-      if (firstLoad && data.years.length) catalogYears.value = [data.years[0].year];
+    const catalogTimers = {};
+    function applyCatalog(src, data) {
+      const bucket = catalogs[src];
+      const firstLoad = !bucket.data.years.length;
+      Object.assign(bucket.data, data);
+      if (firstLoad && data.years.length) bucket.years = [data.years[0].year];
     }
-    function pollCatalog() {
-      clearTimeout(catalogTimer);
-      if (catalog.running) catalogTimer = setTimeout(refreshCatalog, 1000);
+    function pollCatalog(src) {
+      clearTimeout(catalogTimers[src]);
+      if (catalogs[src].data.running) catalogTimers[src] = setTimeout(() => refreshCatalog(src), 1000);
     }
-    async function refreshCatalog() {
-      try { applyCatalog(await api('/api/catalog', 'cell')); catalogError.value = ''; }
-      catch (e) { catalogError.value = '目录状态读取失败：' + e.message; }
-      finally { pollCatalog(); }
+    async function refreshCatalog(src) {
+      try { applyCatalog(src, await api('/api/catalog', src)); catalogs[src].error = ''; }
+      catch (e) { catalogs[src].error = '目录状态读取失败：' + e.message; }
+      finally { pollCatalog(src); }
     }
     async function readCatalog(mode) {
-      if (catalogBusy.value || states.cell.running) return;
-      catalogPending.value = true; catalogError.value = ''; catalogNotice.value = '';
-      clearTimeout(catalogTimer);
-      try { applyCatalog(await api('/api/catalog', 'cell', {mode, years:catalogYears.value})); }
-      catch (e) { catalogError.value = e.message; await refreshCatalog(); catalogError.value = e.message; }
-      finally { catalogPending.value = false; pollCatalog(); }
+      const src = currentSource.value, bucket = catalogs[src];
+      if (bucket.pending || bucket.data.running || states[src].running) return;
+      bucket.pending = true; bucket.error = ''; bucket.notice = '';
+      clearTimeout(catalogTimers[src]);
+      try { applyCatalog(src, await api('/api/catalog', src, {mode, years:bucket.years})); }
+      catch (e) { await refreshCatalog(src); bucket.error = e.message; }
+      finally { bucket.pending = false; pollCatalog(src); }
     }
     async function cancelCatalog() {
-      catalogPending.value = true;
-      try { applyCatalog(await api('/api/catalog/cancel', 'cell', {})); }
-      catch (e) { catalogError.value = e.message; }
-      finally { catalogPending.value = false; pollCatalog(); }
+      const src = currentSource.value, bucket = catalogs[src];
+      bucket.pending = true;
+      try { applyCatalog(src, await api('/api/catalog/cancel', src, {})); }
+      catch (e) { bucket.error = e.message; }
+      finally { bucket.pending = false; pollCatalog(src); }
     }
     function appendCatalog() {
-      if (states.cell.running) return;
-      const result = appendIssues(urlsBySource.cell, selectedIssues.value);
-      urlsBySource.cell = result.text;
+      const src = currentSource.value;
+      if (states[src].running) return;
+      const result = appendIssues(urlsBySource[src], selectedIssues.value);
+      urlsBySource[src] = result.text;
       catalogNotice.value = `已追加 ${result.added} 期，跳过 ${result.skipped} 个重复网址。请检查下方列表，再保存或开始抓取。`;
       selectedIssues.value = [];
     }
-    onUnmounted(() => clearTimeout(catalogTimer));
+    onUnmounted(() => Object.values(catalogTimers).forEach(clearTimeout));
     async function loadUrls(src = currentSource.value) {
       try { urlsBySource[src] = (await api('/api/urls.txt', src)).content || ''; }
       catch (e) { pushLog(src, '[error] 读取失败: ' + e.message); }
@@ -532,7 +545,7 @@ createApp({
     }
     async function start() {
       const src = currentSource.value;
-      if (pending[src] || states[src].running || (src === 'cell' && catalogBusy.value)) return;
+      if (pending[src] || states[src].running || catalogs[src].pending || catalogs[src].data.running) return;
       pending[src] = true;
       try {
         if (!await saveUrls(src)) return;
@@ -619,7 +632,7 @@ createApp({
     }
     onMounted(async () => {
       connectSSE();
-      await Promise.all([...['cell', 'nature', 'science'].map(k => loadUrls(k)), refreshCatalog()]);
+      await Promise.all(['cell', 'nature', 'science'].flatMap(k => [loadUrls(k), refreshCatalog(k)]));
     });
 
     return {
@@ -629,6 +642,7 @@ createApp({
       loadUrls, saveUrls, start, stop, stopAll, resumeCf, skipCf, resetCache, download, exportNow,
       switchSource,
       catalog, catalogYears, selectedIssues, catalogPending, catalogBusy, catalogError, catalogNotice,
+      catalogArchiveUrl, currentSourceLabel,
       catalogExisting, unloadedYears, visibleIssues, catalogGroups, urlKey,
       readCatalog, cancelCatalog, selectIssues, groupSelected, groupPartial, appendCatalog,
     };

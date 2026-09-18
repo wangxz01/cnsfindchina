@@ -27,12 +27,22 @@ def main():
         }
         fixtures = Path(__file__).parent / 'fixtures'
 
-        def fake_catalog(mode, selected, known, profile, stop, update):
+        def fake_catalog(mode, selected, known, profile, stop, update, source='cell'):
             # Exercise the real background API, without opening a publisher browser.
             update(status='waiting', message='离线模拟：等待目录加载…')
-            if stop.wait(1):
+            if stop.wait(2):
                 raise issue_catalog.CatalogCancelled()
-            years, issues, _ = issue_catalog.parse_archive((fixtures / 'cell_archive.html').read_text(encoding='utf-8'))
+            if source == 'cell':
+                years, issues, _ = issue_catalog.parse_archive((fixtures / 'cell_archive.html').read_text(encoding='utf-8'))
+            elif source == 'nature':
+                years = issue_catalog.parse_nature_years((fixtures / 'nature_archive.html').read_text(encoding='utf-8'))
+                rows = issue_catalog.parse_nature_issues((fixtures / 'nature_archive_volume.html').read_text(encoding='utf-8'), 1)
+                issues = {str(y): [r for r in rows if r['year'] == y] for y in (1869,1870)}
+                issues['2026'] = [dict(url=urls['nature'], year=2026, volume=654, issue='8119', label='Volume 654, Issue 8119', detail='离线样例')]
+            else:
+                html = (fixtures / 'science_archive.html').read_text(encoding='utf-8')
+                years = issue_catalog.parse_science_years(html)
+                issues = {str(y['year']):issue_catalog.parse_science_issues(html, y['year']) for y in years}
             if mode == 'years':
                 update(years=years, years_complete=True, message='离线测试：年份目录已读取')
             else:
@@ -80,7 +90,7 @@ def main():
             html = (web.STATIC_DIR / 'unified_index.html').read_text(encoding='utf-8')
             return HTMLResponse(html.replace('CNS 期刊爬虫 · 统一控制台', '离线测试 · 模拟数据'))
 
-        uvicorn.run(web.app, host='127.0.0.1', port=8765, log_level='warning')
+        uvicorn.run(web.app, host='127.0.0.1', port=8767, log_level='warning')
 
 
 if __name__ == '__main__':

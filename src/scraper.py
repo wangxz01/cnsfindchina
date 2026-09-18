@@ -22,13 +22,13 @@ import sys
 import time
 from datetime import date
 from pathlib import Path
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 from excel_writer import write_excel, CELL_COLUMNS, column_widths
 NATURE_COLUMNS = CELL_COLUMNS
-from article_metadata import enrich_fields, finalize_fields, publication_dates, expected_article_ids, count_check, china_label
+from article_metadata import enrich_fields, finalize_fields, publication_dates, expected_article_ids, count_check, china_label, Document, clean
 from scraper_common import run_source, cancellable_sleep, merge_cached_fields, ScrapeCancelled
 
 # 共用辅助（避免与 scraper_common 循环 import：scraper_common 用 TYPE_CHECKING 引用本模块）
@@ -84,7 +84,7 @@ class ScraperCallbacks:
         check_clear：可选回调，调用方应在轮询中调用，返回 True 表示页面已恢复。
         CLI 实现可忽略（终端 input 等用户）；Web 实现用于自动消退检测。
         """
-        input(f">>> 完成后回到此终端按 Enter（第 {attempt}/{max_attempts} 次）: ")
+        input(f">>> 完成后回到此终端按 Enter（第 {attempt} 次确认，未通过会继续等待）: ")
         return "user_resumed"
 
     def is_cancelled(self) -> bool:
@@ -194,13 +194,23 @@ def detect_cf_in_html(html: str) -> tuple[bool, str]:
     """扫描原始 HTML 判断是否 CF 拦截页；返回 (是否 CF, 命中标记)。"""
     if not html:
         return False, ""
-    low = html[:30000].lower()  # 只看头部 30KB，CF 标记都在前面
+    low = html[:30000].lower()
     # 1) <title> 内容
-    m = re.search(r"<title[^>]*>([^<]+)</title>", low)
+    m = re.search(r"<title[^>]*>([^<]+)</title>", html, re.I)
     if m:
-        t = m.group(1).strip()
+        t = m.group(1).strip().lower()
         if any(x in t for x in ("just a moment", "are you a robot", "attention required")):
             return True, f"title={t!r}"
+    # Elsevier can put the challenge title in citation metadata beyond 30 KB.
+    # Inspect title-bearing tags throughout the document, not arbitrary article
+    # text/references (which may legitimately mention anti-bot systems).
+    for match in re.finditer(r'<meta\b[^>]*>|<h1\b[^>]*>.*?</h1>', html, re.I | re.S):
+        for node in Document(match.group()).root.walk():
+            key = (node.attrs.get('name') or node.attrs.get('property') or '').lower()
+            if node.tag == 'h1' or (node.tag == 'meta' and key in ('citation_title', 'dc.title', 'og:title')):
+                title = clean(node.text() if node.tag == 'h1' else node.attrs.get('content', ''))
+                if title and _is_challenge_title(title):
+                    return True, 'challenge article title'
     # 2) 正文标记
     for marker in CF_HTML_MARKERS:
         if marker in low:
@@ -254,8 +264,8 @@ def is_cloudflare(page) -> bool:
 
 def wait_until_cf_clear(page, target_url: str | None = None,
                         max_attempts: int = 3, cb: ScraperCallbacks | None = None,
-                        force: bool = False) -> bool:
-    """检测并处理 CF；最多提示用户 max_attempts 次。返回是否已通过。
+                        force: bool = False, ready_check=None) -> bool:
+    """持续等待人工验证；只有主动跳过或取消才返回 False。
 
     设计要点：
     - 不自动 reload/goto（用户反馈自动重导航会再次触发 CF 造成循环）
@@ -264,13 +274,30 @@ def wait_until_cf_clear(page, target_url: str | None = None,
     - force=True：跳过 is_cloudflare 首检，强制进入"提示 + cf_wait"流程
       —— 用于 title 异常但 is_cloudflare 未识别的挑战页（如 Elsevier 的
       "Are you a robot?"：标记在 citation_title meta 里，<title> 不命中）。
+    max_attempts 保留作调用兼容，不作为自动跳过的次数上限。
+    ready_check 在挑战标记消失后验证目标内容确实已加载。
     """
     cb = cb or ScraperCallbacks()
-    if not force and not is_cloudflare(page):
+
+    def _check_clear():
+        try:
+            if target_url:
+                current, target = urlsplit(page.url), urlsplit(target_url)
+                if (current.netloc, current.path.rstrip('/')) != (target.netloc, target.path.rstrip('/')):
+                    return False
+            return not is_cloudflare(page) and (ready_check is None or ready_check())
+        except Exception:
+            return False
+
+    if cb.is_cancelled():
+        return False
+    if not force and _check_clear():
         return True
 
-    for attempt in range(1, max_attempts + 1):
-        cb.log(f"\n[Cloudflare] 检测到人机验证挑战（第 {attempt}/{max_attempts} 次）。")
+    attempt = 0
+    while not cb.is_cancelled():
+        attempt += 1
+        cb.log(f"\n[Cloudflare] 等待验证（第 {attempt} 次提示，不会自动跳过）。")
         if target_url:
             cb.log(f"[Cloudflare] 目标 URL: {target_url}")
         try:
@@ -291,33 +318,27 @@ def wait_until_cf_clear(page, target_url: str | None = None,
             "max_attempts": max_attempts,
         })
 
-        def _check_clear():
-            try:
-                return not is_cloudflare(page)
-            except Exception:
-                return False
-
         result = cb.cf_wait(target_url or "", cur, attempt, max_attempts, _check_clear)
         if result == "cancelled":
             return False
         if result == "skip":
             return False  # 调用方据此记为 [CF BLOCKED]，继续下一篇
-        if result == "auto_cleared":
+        if result == "auto_cleared" and _check_clear():
             cb.log("[Cloudflare] 检测到挑战页已自动消退，继续。")
-            return True  # check_clear 已确认页面正常，跳过重复检测
+            return True
 
         # result == "user_resumed"：给页面稳定时间 + 再检测
-        time.sleep(1.5)
+        page.wait_for_timeout(300)
         try:
             page.wait_for_load_state("domcontentloaded", timeout=15000)
         except Exception:
             pass
 
-        if not is_cloudflare(page):
+        if _check_clear():
             cb.log("[Cloudflare] 已通过。")
             return True
 
-    cb.log("[Cloudflare] 多次尝试后仍未通过。")
+        cb.log('[Cloudflare] 尚未确认目标页面已恢复，继续等待人工处理。')
     return False
 
 
@@ -337,10 +358,10 @@ def _is_challenge_title(title: str) -> bool:
 
 def extract_with_cf_retry(page, url: str, cb, section: str, extract_fn,
                           human_pause_fn, max_retries: int = 5) -> dict | None:
-    """提取 → 若疑似挑战页 → 强制等用户介入 → 重提取，循环至正常或达上限。
+    """提取 → 若疑似挑战页 → 等待目标论文恢复 → 重提取。
 
-    返回正常 fields；用户取消或达到 max_retries 仍异常时返回 None
-    （调用方记为 [CF BLOCKED]，不写缓存）。
+    返回正常 fields；仅用户取消或主动跳过时返回 None。
+    max_retries 保留作调用兼容，挑战页不会因次数耗尽而自动录入失败行。
 
     用于 Cell/Nature/Science 三个 scraper 的 process_issue：goto 通过 CF 检查后，
     extract_fields 拿到的 title 仍可能是 "Are you a robot?" 等——is_cloudflare
@@ -362,22 +383,32 @@ def extract_with_cf_retry(page, url: str, cb, section: str, extract_fn,
                         is_china=None, authors=[], extraction_error=str(exc)[:300])
 
     fields = extract()
-    if section:
-        fields["type"] = section
-    for attempt in range(1, max_retries + 1):
-        if not _is_challenge_title(fields.get("title", "")):
+    while True:
+        if cb.is_cancelled():
+            raise ScrapeCancelled()
+        if section:
+            fields['type'] = section
+        if not _is_challenge_title(fields.get("title", "")) and not is_cloudflare(page):
             return fields
-        cb.log(f"        [warn] 第 {attempt}/{max_retries} 次提取疑似挑战页 "
-               f"(title={fields.get('title')!r})，请手动处理后继续")
-        # force=True 跳过 is_cloudflare 首检；max_attempts=1 让本函数外层循环控制总次数
+        cb.log(f"        [warn] 当前页面尚未恢复为论文 (title={fields.get('title')!r})，等待人工验证")
+        verified = {}
+
+        def article_ready():
+            # A negative challenge detector alone is insufficient: the original
+            # failure was a challenge title missed by the HTML detector. Confirm
+            # the same extraction path now yields a genuine article title.
+            candidate = extract()
+            title = candidate.get('title', '')
+            if _is_challenge_title(title) or title in ('[GOTO FAILED]', '[CF BLOCKED]'):
+                return False
+            verified['fields'] = candidate
+            return True
+
         if not wait_until_cf_clear(page, target_url=url, cb=cb,
-                                   max_attempts=1, force=True):
+                                   force=True, ready_check=article_ready):
             return None
         human_pause_fn(page, 1.2, 2.8)
-        fields = extract()
-        if section:
-            fields["type"] = section
-    return fields if not _is_challenge_title(fields.get('title', '')) else None
+        fields = verified.get('fields') or extract()
 
 
 # ---------- issue 列表抽取 ----------
@@ -721,7 +752,7 @@ def process_issue(page, issue_url: str, use_cache: bool = True,
         if cb.is_cancelled():
             raise ScrapeCancelled()
         if fields is None:
-            cb.log("        [error] 多次重试仍是挑战页，记为 [CF BLOCKED]")
+            cb.log("        [warn] 用户主动跳过验证，记为 [CF BLOCKED]，不写入缓存")
             fields = {
                 "url": url, "title": "[CF BLOCKED]", "doi": pii, "type": section,
                 "first_author": "", "first_aff": "", "first_author_country": "",

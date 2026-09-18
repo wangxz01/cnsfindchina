@@ -54,20 +54,27 @@ uv run python src/unified_web.py --port 8080
 1. 选择 Cell / Nature / Science，填写 issue URL，每行一个；支持空行与 `#` 注释。
 2. 点击“开始抓取”，程序保存配置后运行。三个来源可并行，同一来源只允许一个任务。
 3. 遇到人机验证，在爬虫浏览器中手动完成，然后点“我已通过验证”；也可跳过当前文章。
+   文章验证会持续等待，只有确认目标论文恢复后才继续；过早点击确认会继续等待，不会因重试次数耗尽自动写入失败行。主动点击“跳过此文章”才记录失败占位，点击停止则取消任务。
 4. 网页显示日期、国家判断及数据完整性；中国记录标粉色。
 5. 抓取结束后下载 Excel。“部分完成”表示仍有缺失字段、失败文章或数量校验差异。
 6. 点击停止后显示“正在停止”，到检查点保存已有记录，再显示“已取消”。导航请求自身有超时，停止不承诺立即中断正在进行的网络请求。
 
-### Cell：从官方目录选期
+### 三刊：从官方目录选期
 
-原有手填 URL、保存、开始抓取的操作保持不变。Cell 的配置区新增了可折叠的“从目录选期”：
+原有手填 URL、保存、开始抓取的操作保持不变。Cell、Nature、Science 的配置区均有可折叠的“从目录选期”：
 
 1. 点击“读取年份目录”。程序打开本地浏览器，自动翻页读取官网实际列出的年份，包括较早年份。
 2. 勾选一个或多个年份，点击“读取所选年份期号”。程序展开这些年份，读取真实期次链接，按年份、卷号分组；不会假定一年一卷或每卷期数固定。
 3. 勾选单期、整卷，或全选当前年份的期号。可预览全部已选网址；切换年份保留此前的期号选择。
 4. 点击“追加到 URL 列表”。原有网址、注释和顺序保留，重复网址跳过；此时尚未保存文件或启动抓取。检查后照常保存或开始抓取。
 
-遇到人机验证或 Cookie 提示，在打开的 Cell 浏览器中手动处理；程序保持响应并自动继续，最多等待 5 分钟。可随时请求取消目录读取；已读到的年份和完整期号列表保留，失败可重试。Cell 目录读取与 Cell 文章抓取共用浏览器登录状态，不能同时启动；Nature、Science 可继续独立使用。
+遇到人机验证或 Cookie 提示，在对应期刊打开的浏览器中手动处理；程序保持响应并自动继续，最多等待 5 分钟。可随时请求取消目录读取；已读到的年份和完整期号列表保留，失败可重试。同一刊的目录读取与文章抓取共用浏览器登录状态，不能同时启动；不同期刊可独立运行。切换期刊会保留各自的目录、年份、期号勾选和未保存的输入框，不会把异步返回的结果追加到另一刊。
+
+目录来源与历史期次处理：
+
+- [Cell 官方目录](https://www.sciencedirect.com/journal/cell/issues)：自动翻页读取年份，再展开选定年份。
+- [Nature 官方目录](https://www.nature.com/nature/volumes)：读取年份对应的所有卷，再逐卷读取期号。早期跨年卷同时关联两年，按每一期的实际日期归类，例如 Volume 1 的 1869 年和 1870 年期次会分开。
+- [Science 官方目录](https://www.science.org/loi/science)：访问官网给出的年份链接，只读取该年份的期号面板；支持早期的 `os-1` 等原始卷号。
 
 目录数据保存在服务进程内，刷新网页可以恢复；勾选项和未保存的输入框内容仅保存在当前页面，刷新前请先追加并保存。重新启动服务后需要重新读取目录。目录中显示的是**期次日期**，不用于填充文章的 Available online 或 Version of Record。历史合刊与增刊使用官网原始链接；未知链接格式会提示核对，不会静默忽略。
 
@@ -135,12 +142,15 @@ Excel 和 JSON 缓存均通过临时文件原子替换，降低中途异常损�
 uv run python -m unittest discover -s tests -v
 # 用模拟数据手动检查 UI；不访问期刊网站，不修改正式 data 文件
 uv run python tests/preview_server.py
-# 打开 http://127.0.0.1:8765/
+# 打开 http://127.0.0.1:8767/
 # 真实文章单篇检查：打开本地浏览器，手动过验证后在终端按 Enter
 uv run python tests/live_check.py cell
 uv run python tests/live_check.py science
 # 可替换文章；已有验证 Cookie 时可自动开始
 uv run python tests/live_check.py cell --url https://www.sciencedirect.com/science/article/pii/S0092867426003946 --auto
+# 真实目录检查：自动等待人工验证，不修改 URL 配置或启动文章抓取
+uv run python tests/live_catalog_check.py nature --years 1869 2026
+uv run python tests/live_catalog_check.py science --years 1880 2026
 ```
 
 `tests/fixtures` 为自行构造的 HTML 样例，覆盖双日期、作者单位关系、勘误等情形。离线测试通过不代表出版商当前页面一定可访问；真实页面仍可能遇到验证、权限或结构变化。
@@ -155,5 +165,7 @@ uv run python tests/live_check.py cell --url https://www.sciencedirect.com/scien
 | `src/scraper_common.py` | 缓存、取消检查与统一任务生命周期 |
 | `src/excel_writer.py` | 日期单元格、汇总页与原子输出 |
 | `src/unified_web.py` | 三来源任务管理、结果快照与 SSE |
+| `src/issue_catalog.py` | 三刊目录读取、跨年卷归类、独立后台目录任务 |
 | `src/static/unified_index.html` | 网页控制台 |
 | `tests/test_regressions.py` | 离线回归验证 |
+| `tests/test_catalog.py` | 目录解析、年份归类与三来源隔离验证 |

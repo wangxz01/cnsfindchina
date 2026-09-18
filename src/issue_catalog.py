@@ -1,4 +1,4 @@
-"""Read Cell's actual archive links, including paginated years and lazy panels."""
+"""Read publisher archive links, including paginated years and lazy panels."""
 from __future__ import annotations
 
 import re
@@ -9,17 +9,24 @@ from urllib.parse import urljoin, urlsplit
 
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
-from article_metadata import Document, clean
+from article_metadata import Document, clean, normalize_date
 from scraper import is_cloudflare
 
 ARCHIVE_URL = 'https://www.sciencedirect.com/journal/cell/issues'
+ARCHIVE_URLS = dict(cell=ARCHIVE_URL, nature='https://www.nature.com/nature/volumes',
+                    science='https://www.science.org/loi/science')
+LABELS = dict(cell='Cell', nature='Nature', science='Science')
 YEAR_RE = re.compile(r'^\s*(\d{4})\s*[—–-]\s*Volumes?\s', re.I)
 CELL_PATH = r'/journal/cell/vol/(\d+)/(?:issue/(\d+(?:-\d+)*)|suppl/([A-Za-z0-9-]+))/?'
 
 
-def canonical_issue_url(value):
-    parts = urlsplit(urljoin(ARCHIVE_URL, value))
-    if parts.scheme == 'https' and parts.netloc == 'www.sciencedirect.com' and re.fullmatch(CELL_PATH, parts.path):
+ISSUE_PATHS = dict(cell=CELL_PATH, nature=r'/nature/volumes/(\d+)/issues/(\d+)/?',
+                   science=r'/toc/science/((?:os-)?\d+)/(\d+)/?')
+
+
+def canonical_issue_url(value, source='cell'):
+    parts = urlsplit(urljoin(ARCHIVE_URLS[source], value))
+    if parts.scheme == 'https' and parts.netloc == urlsplit(ARCHIVE_URLS[source]).netloc and re.fullmatch(ISSUE_PATHS[source], parts.path):
         return f'https://{parts.netloc}{parts.path.rstrip("/")}'
     return ''
 
@@ -65,6 +72,136 @@ def parse_archive(html, page_url=ARCHIVE_URL):
     return years, issues, unsupported
 
 
+def parse_nature_years(html):
+    found = {}
+    heading_year = None
+    for node in Document(html).root.walk():
+        if node.tag == 'h3' and re.fullmatch(r'\d{4}', clean(node.text())):
+            heading_year = int(clean(node.text()))
+        if node.tag != 'a':
+            continue
+        parts = urlsplit(urljoin(ARCHIVE_URLS['nature'], node.attrs.get('href', '')))
+        match = re.fullmatch(r'/nature/volumes/(\d+)/?', parts.path)
+        if parts.netloc != 'www.nature.com' or parts.scheme != 'https' or not match:
+            continue
+        period = clean(node.parent.text())
+        # Old volumes span two calendar years (e.g. Nov 1869 - Apr 1870).
+        # Associate the volume with both, then filter issues by their actual date.
+        dates = sorted({int(y) for y in re.findall(r'\b(?:18|19|20|21)\d{2}\b', period)})
+        if not dates and heading_year:
+            dates = [heading_year]
+        if not dates:
+            raise RuntimeError(f'无法确定 Nature 卷 {match[1]} 的年份')
+        for year in range(dates[0], dates[-1] + 1):
+            item = found.setdefault(year, dict(year=year, label=f'{year} 年', page_url=ARCHIVE_URLS['nature'], volumes=[]))
+            volume = dict(volume=int(match[1]), url=f'https://www.nature.com{parts.path.rstrip("/")}', period=period)
+            if not any(v['url'] == volume['url'] for v in item['volumes']):
+                item['volumes'].append(volume)
+    return sorted(found.values(), key=lambda y: y['year'], reverse=True)
+
+
+def parse_nature_issues(html, expected_volume):
+    root = Document(html).root
+    container = next((n for n in root.walk() if n.attrs.get('id') == 'issue-list'), None)
+    rows, seen = [], set()
+    if container is None:
+        return rows
+    for node in container.walk():
+        if node.tag != 'a' or '/issues/' not in node.attrs.get('href', ''):
+            continue
+        url = canonical_issue_url(node.attrs['href'], 'nature')
+        if not url:
+            raise RuntimeError('Nature 目录出现未知期号链接，请核对官网。')
+        match = re.fullmatch(ISSUE_PATHS['nature'], urlsplit(url).path)
+        if int(match[1]) != int(expected_volume):
+            raise RuntimeError('Nature 返回的卷号与请求不一致，请重新读取目录。')
+        if url in seen:
+            continue
+        date = normalize_date(clean(node.text()))
+        if not date:
+            raise RuntimeError(f'Nature 第 {match[2]} 期缺少可识别的期次日期，无法按年份归类。')
+        seen.add(url)
+        rows.append(dict(url=url, year=int(date[:4]), volume=int(match[1]), issue=match[2],
+                         label=f'Volume {match[1]}, Issue {match[2]}', detail=clean(node.text())))
+    return rows
+
+
+def parse_science_years(html):
+    years = {}
+    for node in Document(html).root.walk():
+        if node.tag != 'a':
+            continue
+        parts = urlsplit(urljoin(ARCHIVE_URLS['science'], node.attrs.get('href', '')))
+        match = re.fullmatch(r'/loi/science/group/d\d{4}\.y(\d{4})', parts.path)
+        if parts.scheme == 'https' and parts.netloc == 'www.science.org' and match:
+            year = int(match[1])
+            years[year] = dict(year=year, label=f'{year} 年', page_url=f'https://www.science.org{parts.path}')
+    return sorted(years.values(), key=lambda y: y['year'], reverse=True)
+
+
+def parse_science_issues(html, year):
+    root = Document(html).root
+    rows, seen = [], set()
+    for panel in root.walk():
+        if panel.attrs.get('role') != 'tabpanel' or not panel.attrs.get('id', '').endswith(f'-y{year}'):
+            continue
+        for node in panel.walk():
+            if node.tag != 'a' or not node.has_class('past-issue'):
+                continue
+            url = canonical_issue_url(node.attrs.get('href', ''), 'science')
+            if not url:
+                raise RuntimeError('Science 目录出现未知期号链接，请核对官网。')
+            if url in seen:
+                continue
+            seen.add(url)
+            match = re.fullmatch(ISSUE_PATHS['science'], urlsplit(url).path)
+            rows.append(dict(url=url, year=year, volume=match[1], issue=match[2],
+                             label=f'Volume {match[1]}, Issue {match[2]}', detail=clean(node.text())))
+    return rows
+
+
+def read_other_catalog(page, source, mode, selected_years, known_years, stop, update):
+    def navigate(url, parse):
+        if stop.is_set():
+            raise CatalogCancelled()
+        try:
+            page.goto(url, wait_until='domcontentloaded', timeout=30000)
+        except PlaywrightTimeout:
+            pass
+        return _wait(page, lambda: parse(page.content()), stop, update)
+
+    if mode == 'years':
+        parser = parse_nature_years if source == 'nature' else parse_science_years
+        years = navigate(ARCHIVE_URLS[source], parser)
+        update(years=years, years_complete=True,
+               message=f'已读取目录中的 {len(years)} 个年份，请勾选年份后读取期号。')
+        return
+
+    known = {y['year']: y for y in known_years}
+    volumes = {}
+    for year in sorted(selected_years, reverse=True):
+        if stop.is_set():
+            raise CatalogCancelled()
+        if source == 'science':
+            update(message=f'正在读取 Science {year} 年期号…')
+            rows = navigate(known[year]['page_url'], lambda html: parse_science_issues(html, year))
+        else:
+            rows = []
+            expected = known[year]['volumes']
+            for index, volume in enumerate(expected, 1):
+                if stop.is_set():
+                    raise CatalogCancelled()
+                update(message=f'正在读取 Nature {year} 年 · Volume {volume["volume"]}（{index}/{len(expected)} 卷）…')
+                if volume['url'] not in volumes:
+                    volumes[volume['url']] = navigate(volume['url'], lambda html: parse_nature_issues(html, volume['volume']))
+                rows.extend(row for row in volumes[volume['url']] if row['year'] == year)
+            rows = list({row['url']: row for row in rows}.values())
+            if not rows:
+                raise RuntimeError(f'未读到 Nature {year} 年的期号，请刷新目录后重试。')
+        update(issue_year=str(year), issue_rows=rows)
+    update(message=f'已读取所选 {len(selected_years)} 个年份的期号，请勾选后追加。')
+
+
 class CatalogCancelled(Exception):
     pass
 
@@ -80,7 +217,7 @@ def _wait(page, condition, stop, update, timeout=35):
         if blocked:
             if challenge_deadline is None:
                 challenge_deadline = time.monotonic() + 300
-                update(status='waiting', message='请在打开的 Cell 浏览器中完成人机验证或 Cookie 提示；通过后会自动继续（最多等待 5 分钟）。')
+                update(status='waiting', message='请在该期刊打开的浏览器中完成人机验证或 Cookie 提示；通过后会自动继续（最多等待 5 分钟）。')
             if time.monotonic() > challenge_deadline:
                 raise RuntimeError('等待验证超时，请重新读取目录。')
             deadline = time.monotonic() + timeout
@@ -120,7 +257,7 @@ def _read_year(page, button, year, target, stop, update):
     return rows[str(year)]
 
 
-def read_catalog(mode, selected_years, known_years, profile_dir, stop, update):
+def read_catalog(mode, selected_years, known_years, profile_dir, stop, update, source='cell'):
     with sync_playwright() as p:
         ctx = p.chromium.launch_persistent_context(
             user_data_dir=str(profile_dir), headless=False,
@@ -129,6 +266,9 @@ def read_catalog(mode, selected_years, known_years, profile_dir, stop, update):
         try:
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
             page.set_default_timeout(10000)
+            if source != 'cell':
+                read_other_catalog(page, source, mode, selected_years, known_years, stop, update)
+                return
             buttons = page.locator('.accordion-panel-title').filter(has_text=YEAR_RE)
 
             def navigate(url):
@@ -180,7 +320,8 @@ def read_catalog(mode, selected_years, known_years, profile_dir, stop, update):
 
 
 class CatalogSession:
-    def __init__(self):
+    def __init__(self, source='cell'):
+        self.source = source
         self.lock = threading.RLock()
         self.stop_event = threading.Event()
         self.thread = None
@@ -202,14 +343,14 @@ class CatalogSession:
             if self.thread is not None:
                 raise RuntimeError('目录正在读取中')
             self.stop_event.clear()
-            self.update(status='reading', error='', message='正在打开 Cell 官方目录…')
+            self.update(status='reading', error='', message=f'正在打开 {LABELS[self.source]} 官方目录…')
             if mode == 'years':
                 self.update(years_complete=False)
             known = deepcopy(self.data['years'])
 
             def worker():
                 try:
-                    read_catalog(mode, years, known, profile_dir, self.stop_event, self.update)
+                    read_catalog(mode, years, known, profile_dir, self.stop_event, self.update, source=self.source)
                     self.update(status='done')
                 except CatalogCancelled:
                     self.update(status='cancelled', message='已取消读取；已读到的目录可继续使用。')

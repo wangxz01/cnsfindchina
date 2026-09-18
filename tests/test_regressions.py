@@ -169,7 +169,7 @@ class MetadataTests(unittest.TestCase):
     def test_cf_final_retry_can_succeed_and_pause_receives_page(self):
         good = complete_fields()
         page = object()
-        with patch.object(scraper, 'wait_until_cf_clear', return_value=True), patch.object(scraper, 'human_pause') as pause:
+        with patch.object(scraper, 'is_cloudflare', return_value=False), patch.object(scraper, 'wait_until_cf_clear', return_value=True), patch.object(scraper, 'human_pause') as pause:
             values = iter([{'title':'Just a moment'}, good])
             result = scraper.extract_with_cf_retry(page, 'url', scraper.ScraperCallbacks(), 'Article',
                       lambda *args: next(values), pause, max_retries=1)
