@@ -11,6 +11,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 import uvicorn
 import unified_web as web
+import issue_catalog
 from article_metadata import enrich_fields
 from countries import parse_country
 from excel_writer import write_excel
@@ -25,6 +26,23 @@ def main():
             'science': 'https://www.science.org/toc/science/392/6804',
         }
         fixtures = Path(__file__).parent / 'fixtures'
+
+        def fake_catalog(mode, selected, known, profile, stop, update):
+            # Exercise the real background API, without opening a publisher browser.
+            update(status='waiting', message='离线模拟：等待目录加载…')
+            if stop.wait(1):
+                raise issue_catalog.CatalogCancelled()
+            years, issues, _ = issue_catalog.parse_archive((fixtures / 'cell_archive.html').read_text(encoding='utf-8'))
+            if mode == 'years':
+                update(years=years, years_complete=True, message='离线测试：年份目录已读取')
+            else:
+                for year in selected:
+                    if str(year) not in issues:
+                        raise RuntimeError('离线测试：该年份模拟加载失败')
+                    update(issue_year=str(year), issue_rows=issues[str(year)])
+                update(message='离线测试：期号已读取')
+
+        issue_catalog.read_catalog = fake_catalog
 
         def make_run(source):
             def run(urls, out_path, cb, **kwargs):

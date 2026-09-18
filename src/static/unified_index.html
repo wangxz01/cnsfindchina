@@ -155,6 +155,18 @@
   .tag-cached { background: #eaeaec; color: #6e6e73; }
 
   .footnote { color: #6e6e73; font-size: 12px; margin-top: 12px; }
+  .catalog { margin: 14px 0; border: 1px solid #dce7f3; border-radius: 8px; padding: 12px; background: #f8fbff; font-size: 13px; }
+  .catalog summary { cursor: pointer; font-weight: 600; color: #0066cc; }
+  .catalog p { line-height: 1.6; margin: 10px 0; }
+  .catalog-years { display: grid; grid-template-columns: repeat(auto-fill, minmax(95px, 1fr)); gap: 8px; max-height: 165px; overflow: auto; margin: 12px 0; }
+  .catalog label { cursor: pointer; display: flex; align-items: flex-start; gap: 7px; }
+  .catalog input[type=checkbox] { flex: 0 0 auto; margin-top: 3px; }
+  .catalog-issues { max-height: 340px; overflow: auto; margin-top: 12px; border-top: 1px solid #dce7f3; }
+  .catalog-group { padding: 12px 0; border-bottom: 1px solid #dce7f3; }
+  .catalog-issue { padding: 7px 0; }
+  .catalog-issue small { display: block; margin-top: 3px; color: #6e6e73; }
+  .catalog-error { color: #a02020; overflow-wrap: anywhere; }
+  .catalog-preview { max-height: 160px; overflow: auto; padding-left: 24px; overflow-wrap: anywhere; }
 </style>
 </head>
 <body>
@@ -204,6 +216,56 @@
     <div>
       <div class="card">
         <h2>1 · 配置 urls.txt</h2>
+        <details class="catalog" v-if="currentSource === 'cell'">
+          <summary>从目录选期 · 不用手写网址</summary>
+          <p>读取 <a href="https://www.sciencedirect.com/journal/cell/issues" target="_blank" rel="noopener">Cell 官方目录</a>，选择年份和期号后追加到下方。原有网址和注释会保留，重复网址自动跳过。</p>
+          <div class="btn-row">
+            <button class="btn-primary btn-sm" @click="readCatalog('years')" :disabled="busy || catalogBusy">{{ catalog.years.length ? '刷新年份目录' : '读取年份目录' }}</button>
+            <button v-if="catalogBusy" class="btn-ghost btn-sm" @click="cancelCatalog" :disabled="catalogPending || catalog.status === 'stopping'">取消读取</button>
+          </div>
+          <p role="status" aria-live="polite">{{ catalog.message }}</p>
+          <p v-if="catalog.error || catalogError" class="catalog-error" role="alert">{{ catalogError || catalog.error }}</p>
+          <template v-if="catalog.years.length">
+            <p><b>① 勾选年份</b> · 已选 {{ catalogYears.length }} 年 <span v-if="!catalog.years_complete">（目录尚未完整读完）</span></p>
+            <div class="catalog-years">
+              <label v-for="year in catalog.years" :key="year.year" :title="year.label">
+                <input type="checkbox" v-model="catalogYears" :value="year.year" :disabled="catalogBusy">{{ year.year }} 年
+              </label>
+            </div>
+            <div class="btn-row">
+              <button class="btn-primary btn-sm" @click="readCatalog('issues')" :disabled="busy || catalogBusy || !catalogYears.length">读取所选年份期号</button>
+              <button class="btn-ghost btn-sm" @click="catalogYears = catalog.years.map(y => y.year)" :disabled="catalogBusy">选择全部年份</button>
+              <button class="btn-ghost btn-sm" @click="catalogYears = []" :disabled="catalogBusy">清空年份选择</button>
+            </div>
+            <p v-if="unloadedYears.length">尚未读取期号：{{ unloadedYears.join('、') }}。点击上方“读取所选年份期号”。</p>
+          </template>
+          <template v-if="catalogGroups.length">
+            <p><b>② 勾选期号</b> · 当前年份显示 {{ visibleIssues.length }} 期；日期为期次日期</p>
+            <div class="btn-row">
+              <button class="btn-ghost btn-sm" @click="selectIssues(visibleIssues, true)" :disabled="busy">全选当前年份期号</button>
+              <button class="btn-ghost btn-sm" @click="selectIssues(visibleIssues, false)" :disabled="busy">取消当前年份期号</button>
+            </div>
+            <div class="catalog-issues">
+              <section class="catalog-group" v-for="group in catalogGroups" :key="group.key">
+                <label><input type="checkbox" :checked="groupSelected(group.rows)" :indeterminate="groupPartial(group.rows)" @change="selectIssues(group.rows, $event.target.checked)" :disabled="busy || group.rows.every(row => catalogExisting.has(urlKey(row.url)))"><b>{{ group.year }} 年 · Volume {{ group.volume }}</b>（{{ group.rows.length }} 期）</label>
+                <label class="catalog-issue" v-for="issue in group.rows" :key="issue.url">
+                  <input type="checkbox" v-model="selectedIssues" :value="issue.url" :disabled="busy || catalogExisting.has(urlKey(issue.url))">
+                  <span>{{ issue.label }} <span v-if="catalogExisting.has(urlKey(issue.url))">· 已在输入框</span><small>{{ issue.detail }}</small></span>
+                </label>
+              </section>
+            </div>
+          </template>
+          <template v-if="selectedIssues.length">
+            <details style="margin-top:12px"><summary>③ 预览已选 {{ selectedIssues.length }} 期（包含其他年份的选择）</summary>
+              <ul class="catalog-preview"><li v-for="url in selectedIssues" :key="url"><a :href="url" target="_blank" rel="noopener">{{ url }}</a></li></ul>
+            </details>
+            <div class="btn-row">
+              <button class="btn-primary btn-sm" @click="appendCatalog" :disabled="busy">追加到 URL 列表（{{ selectedIssues.length }} 期）</button>
+              <button class="btn-ghost btn-sm" @click="selectedIssues = []" :disabled="busy">清空全部期号选择</button>
+            </div>
+          </template>
+          <p v-if="catalogNotice" role="status">{{ catalogNotice }}</p>
+        </details>
         <textarea v-model="urlsText" placeholder="每行一个 issue URL，# 开头为注释"></textarea>
         <div class="btn-row">
           <button class="btn-ghost btn-sm" @click="loadUrls()" :disabled="busy">↺ 重新读取文件</button>
@@ -236,7 +298,7 @@
           <span v-else-if="state.out_path">输出：<code style="font-size: 11px;">{{ state.out_path }}</code></span>
         </div>
         <div class="btn-row">
-          <button class="btn-primary" @click="start" :disabled="busy">▶ 开始抓取</button>
+          <button class="btn-primary" @click="start" :disabled="busy || (currentSource === 'cell' && catalogBusy)">▶ 开始抓取</button>
           <button class="btn-danger" @click="stop" :disabled="!busy">■ 停止当前</button>
           <button class="btn-danger" @click="stopAll" v-if="runningSources.length > 1">■ 停止全部</button>
           <button class="btn-ghost" @click="resetCache" :disabled="busy">🗑 清空缓存</button>
@@ -302,7 +364,8 @@
 </div>
 
 <script type="module">
-import { createApp, reactive, computed, ref, onMounted, nextTick, watch } from 'https://cdn.jsdelivr.net/npm/vue@3/dist/vue.esm-browser.prod.js';
+import { createApp, reactive, computed, ref, onMounted, onUnmounted, nextTick, watch } from 'https://cdn.jsdelivr.net/npm/vue@3/dist/vue.esm-browser.prod.js';
+import { urlKey, existingUrls, appendIssues } from '/static/catalog_helpers.js';
 
 createApp({
   setup() {
@@ -390,6 +453,72 @@ createApp({
       if (!r.ok) throw new Error(data.detail || r.statusText);
       return data;
     }
+    const catalog = reactive({years: [], years_complete: false, issues: {}, running: false, status: 'idle', message: '', error: ''});
+    const catalogYears = ref([]), selectedIssues = ref([]);
+    const catalogPending = ref(false), catalogError = ref(''), catalogNotice = ref('');
+    const catalogBusy = computed(() => catalogPending.value || catalog.running);
+    const catalogExisting = computed(() => existingUrls(urlsBySource.cell));
+    const unloadedYears = computed(() => catalogYears.value.filter(y => !catalog.issues[String(y)]));
+    const visibleIssues = computed(() => catalogYears.value.slice().sort((a,b) => b-a).flatMap(y => catalog.issues[String(y)] || []));
+    const catalogGroups = computed(() => {
+      const groups = new Map();
+      for (const row of visibleIssues.value) {
+        const key = `${row.year}-${row.volume}`;
+        if (!groups.has(key)) groups.set(key, {key, year:row.year, volume:row.volume, rows:[]});
+        groups.get(key).rows.push(row);
+      }
+      return [...groups.values()];
+    });
+    function availableIssues(rows) { return rows.filter(row => !catalogExisting.value.has(urlKey(row.url))); }
+    function groupSelected(rows) {
+      const available = availableIssues(rows);
+      return available.length > 0 && available.every(row => selectedIssues.value.includes(row.url));
+    }
+    function groupPartial(rows) { return !groupSelected(rows) && availableIssues(rows).some(row => selectedIssues.value.includes(row.url)); }
+    function selectIssues(rows, checked) {
+      const selection = new Set(selectedIssues.value);
+      for (const row of checked ? availableIssues(rows) : rows) {
+        if (checked) selection.add(row.url); else selection.delete(row.url);
+      }
+      selectedIssues.value = [...selection];
+    }
+    let catalogTimer;
+    function applyCatalog(data) {
+      const firstLoad = !catalog.years.length;
+      Object.assign(catalog, data);
+      if (firstLoad && data.years.length) catalogYears.value = [data.years[0].year];
+    }
+    function pollCatalog() {
+      clearTimeout(catalogTimer);
+      if (catalog.running) catalogTimer = setTimeout(refreshCatalog, 1000);
+    }
+    async function refreshCatalog() {
+      try { applyCatalog(await api('/api/catalog', 'cell')); catalogError.value = ''; }
+      catch (e) { catalogError.value = '目录状态读取失败：' + e.message; }
+      finally { pollCatalog(); }
+    }
+    async function readCatalog(mode) {
+      if (catalogBusy.value || states.cell.running) return;
+      catalogPending.value = true; catalogError.value = ''; catalogNotice.value = '';
+      clearTimeout(catalogTimer);
+      try { applyCatalog(await api('/api/catalog', 'cell', {mode, years:catalogYears.value})); }
+      catch (e) { catalogError.value = e.message; await refreshCatalog(); catalogError.value = e.message; }
+      finally { catalogPending.value = false; pollCatalog(); }
+    }
+    async function cancelCatalog() {
+      catalogPending.value = true;
+      try { applyCatalog(await api('/api/catalog/cancel', 'cell', {})); }
+      catch (e) { catalogError.value = e.message; }
+      finally { catalogPending.value = false; pollCatalog(); }
+    }
+    function appendCatalog() {
+      if (states.cell.running) return;
+      const result = appendIssues(urlsBySource.cell, selectedIssues.value);
+      urlsBySource.cell = result.text;
+      catalogNotice.value = `已追加 ${result.added} 期，跳过 ${result.skipped} 个重复网址。请检查下方列表，再保存或开始抓取。`;
+      selectedIssues.value = [];
+    }
+    onUnmounted(() => clearTimeout(catalogTimer));
     async function loadUrls(src = currentSource.value) {
       try { urlsBySource[src] = (await api('/api/urls.txt', src)).content || ''; }
       catch (e) { pushLog(src, '[error] 读取失败: ' + e.message); }
@@ -403,7 +532,7 @@ createApp({
     }
     async function start() {
       const src = currentSource.value;
-      if (pending[src] || states[src].running) return;
+      if (pending[src] || states[src].running || (src === 'cell' && catalogBusy.value)) return;
       pending[src] = true;
       try {
         if (!await saveUrls(src)) return;
@@ -490,7 +619,7 @@ createApp({
     }
     onMounted(async () => {
       connectSSE();
-      await Promise.all(['cell', 'nature', 'science'].map(k => loadUrls(k)));
+      await Promise.all([...['cell', 'nature', 'science'].map(k => loadUrls(k)), refreshCatalog()]);
     });
 
     return {
@@ -499,6 +628,9 @@ createApp({
       busy, statusLabel, progressPercent, lineClass, chinaCount, unknownCount,
       loadUrls, saveUrls, start, stop, stopAll, resumeCf, skipCf, resetCache, download, exportNow,
       switchSource,
+      catalog, catalogYears, selectedIssues, catalogPending, catalogBusy, catalogError, catalogNotice,
+      catalogExisting, unloadedYears, visibleIssues, catalogGroups, urlKey,
+      readCatalog, cancelCatalog, selectIssues, groupSelected, groupPartial, appendCatalog,
     };
   }
 }).mount('#app');

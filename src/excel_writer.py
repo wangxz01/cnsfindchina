@@ -33,10 +33,13 @@ def column_widths(columns):
 
 
 def _sheet_name_from_url(url):
-    m = re.search(r"/vol(?:umes)?/(\d+)/issues?/(\d+)|/toc/science/(\d+)/(\d+)", url)
+    m = re.search(r"/vol(?:umes)?/(\d+)/issues?/(\d+(?:-\d+)*)|/toc/science/(\d+)/(\d+)", url)
     if m:
         volume, issue = (m.group(1), m.group(2)) if m.group(1) else (m.group(3), m.group(4))
         return f"v{volume}-i{issue}"
+    m = re.search(r'/vol/(\d+)/suppl/([A-Za-z0-9-]+)', url)
+    if m:
+        return f'v{m[1]}-suppl-{m[2]}'[:31]
     return re.sub(r"[\\/*?:\[\]]", "-", "-".join(url.rstrip("/").split("/")[-2:]))[:31] or "issue"
 
 

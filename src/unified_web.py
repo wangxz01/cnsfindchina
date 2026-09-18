@@ -32,6 +32,7 @@ from scraper import ScraperCallbacks
 from article_metadata import finalize_fields
 from excel_writer import column_widths
 from scraper_common import CACHE_VERSION
+from issue_catalog import CatalogSession, CELL_PATH
 
 
 # ---------- Source 配置 ----------
@@ -181,6 +182,7 @@ class Session:
 # 先建 bus 与 SESSIONS（注意顺序：Session.set_status 引用 bus，需 bus 先于 Session 实例化）
 bus = EventBus()
 SESSIONS: dict[str, Session] = {k: Session(k) for k in ("cell", "nature", "science")}
+CATALOG = CatalogSession()
 
 
 # ---------- WebCallbacks：桥接 scraper 事件 → session 状态 + bus ----------
@@ -347,6 +349,40 @@ def _resolve_source(source: str | None) -> SourceConfig:
     return SOURCES[source]
 
 
+@app.get('/api/catalog')
+def catalog_status(source: str = Query(...)):
+    if source != 'cell':
+        raise HTTPException(400, '从目录选期目前支持 Cell')
+    return CATALOG.snapshot()
+
+
+@app.post('/api/catalog')
+def catalog_start(payload: dict, source: str = Query(...)):
+    catalog_status(source)
+    mode = payload.get('mode', 'years')
+    years = payload.get('years', [])
+    if mode not in ('years', 'issues'):
+        raise HTTPException(400, '未知目录读取方式')
+    if not isinstance(years, list) or not all(type(y) is int for y in years):
+        raise HTTPException(400, '年份必须是整数列表')
+    with bus._lock, SESSIONS['cell'].lock:
+        snapshot = CATALOG.snapshot()
+        if snapshot['running'] or SESSIONS['cell'].thread is not None:
+            raise HTTPException(409, 'Cell 正在读取目录或抓取文章，请等待完成或先取消')
+        known = {y['year'] for y in snapshot['years']}
+        if mode == 'issues' and (not years or not set(years).issubset(known)):
+            raise HTTPException(400, '请先读取目录，再选择目录中存在的年份')
+        CATALOG.start(mode, sorted(set(years), reverse=True), cell_mod.PROFILE_DIR)
+        return CATALOG.snapshot()
+
+
+@app.post('/api/catalog/cancel')
+def catalog_cancel(source: str = Query(...)):
+    catalog_status(source)
+    CATALOG.cancel()
+    return CATALOG.snapshot()
+
+
 @app.get("/api/urls.txt")
 def get_urls(source: str = Query(...)):
     cfg = _resolve_source(source)
@@ -371,7 +407,7 @@ def save_urls(payload: dict, source: str = Query(...)):
 
 def validate_urls(urls, source):
     patterns = {
-        'cell': ('www.sciencedirect.com', r'/journal/cell/vol/\d+/issue/\d+/?'),
+        'cell': ('www.sciencedirect.com', CELL_PATH),
         'nature': ('www.nature.com', r'/nature/volumes/\d+/issues/\d+/?'),
         'science': ('www.science.org', r'/toc/science/\d+/\d+/?'),
     }
@@ -413,6 +449,8 @@ def start(payload: dict | None = None, source: str = Query(...)):
     use_cache = not bool((payload or {}).get("fresh", False))
 
     with bus._lock, session.lock:
+        if source == 'cell' and CATALOG.snapshot()['running']:
+            raise HTTPException(409, 'Cell 正在读取目录，请等待完成或先取消目录读取')
         if session.thread is not None:
             raise HTTPException(409, f'{source} 已有任务在运行或停止中')
         session.stop_event.clear()
